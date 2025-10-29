@@ -451,10 +451,84 @@ class FileIndexer: ObservableObject {
             }
             sqlite3_finalize(statement)
         }
-        
+
         // Update progress to trigger UI refresh
         DispatchQueue.main.async {
             self.indexProgress = 0
         }
+    }
+
+    // MARK: - Folder Discovery
+
+    /// Returns a hierarchical structure of all indexed folders and their immediate subfolders
+    func discoverFolderHierarchy() -> [FolderNode] {
+        var folderSet = Set<String>()
+
+        dbQueue.sync {
+            var statement: OpaquePointer?
+            let sql = "SELECT DISTINCT path FROM files ORDER BY path"
+
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let fullPath = String(cString: sqlite3_column_text(statement, 0))
+                    let url = URL(fileURLWithPath: fullPath)
+
+                    // Add all parent directories up to (but not including) the root
+                    var currentURL = url.deletingLastPathComponent()
+                    while currentURL.path != "/" {
+                        folderSet.insert(currentURL.path)
+                        currentURL = currentURL.deletingLastPathComponent()
+                    }
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        // Build hierarchy from flat list
+        return buildHierarchy(from: Array(folderSet))
+    }
+
+    /// Builds a hierarchical tree from a flat list of paths
+    private func buildHierarchy(from paths: [String]) -> [FolderNode] {
+        var nodeMap: [String: FolderNode] = [:]
+        var rootNodes: [FolderNode] = []
+
+        // Sort paths to ensure parents are processed before children
+        let sortedPaths = paths.sorted()
+
+        for path in sortedPaths {
+            let url = URL(fileURLWithPath: path)
+            let parentPath = url.deletingLastPathComponent().path
+
+            // Create or get the current node
+            let node = nodeMap[path] ?? FolderNode(path: path, name: url.lastPathComponent)
+            nodeMap[path] = node
+
+            // Check if this is a root folder (in indexedFolders)
+            if indexedFolders.contains(path) {
+                rootNodes.append(node)
+            } else if let parentNode = nodeMap[parentPath] {
+                // Add as child to parent
+                if !parentNode.children.contains(where: { $0.path == path }) {
+                    parentNode.children.append(node)
+                }
+            }
+        }
+
+        return rootNodes.sorted { $0.path < $1.path }
+    }
+}
+
+/// Represents a folder in the hierarchy
+class FolderNode: Identifiable, ObservableObject {
+    let id = UUID()
+    let path: String
+    let name: String
+    @Published var children: [FolderNode] = []
+    @Published var isExpanded: Bool = false
+
+    init(path: String, name: String) {
+        self.path = path
+        self.name = name
     }
 }

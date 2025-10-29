@@ -117,10 +117,10 @@ struct MainView: View {
     // Search content with folder filtering
     struct SearchContentView: View {
         @ObservedObject var indexer: FileIndexer
-        
+
         @StateObject private var scopesStore = ScopesStore()
         @State private var selectedScopeName: String = "All"
-        @State private var showManageScopes = false
+        @State private var showFolderSelector = false
 
         @State private var searchText = ""
         @State private var selectedFileType = "All"
@@ -128,10 +128,9 @@ struct MainView: View {
         @State private var sortOrder: SortOrder = .dateDescending
         @State private var isSearching = false
         @State private var searchTask: DispatchWorkItem?
-        @State private var selectedFolders: Set<String> = []
+        @State private var selectedFolderPaths: Set<String> = []
         @State private var showingPreview = false
         @State private var previewItem: FileItem?
-        @State private var showingFolderFilter = false
         
         // Simple “scopes” map: name -> array of folder roots
         
@@ -181,14 +180,17 @@ struct MainView: View {
                     
                     // Status bar
                     statusBarView
-                    
-                        .sheet(isPresented: $showManageScopes) {
-                            ManageScopesView(store: scopesStore, onClose: {
-                                showManageScopes = false
-                                performSearch()
-                            })
+                }
+                .sheet(isPresented: $showFolderSelector) {
+                    FolderSelectionView(
+                        indexer: indexer,
+                        store: scopesStore,
+                        selectedPaths: $selectedFolderPaths,
+                        onClose: {
+                            showFolderSelector = false
+                            performSearch()
                         }
-
+                    )
                 }
                 
                 // Preview pane (optional)
@@ -198,62 +200,255 @@ struct MainView: View {
                 }
             }
         }
-        
-        struct ManageScopesView: View {
+
+        struct FolderSelectionView: View {
+            @ObservedObject var indexer: FileIndexer
             @ObservedObject var store: ScopesStore
+            @Binding var selectedPaths: Set<String>
             var onClose: () -> Void
 
-            @State private var name: String = ""
-            @State private var prefixesText: String = "" // comma-separated
+            @State private var folderHierarchy: [FolderNode] = []
+            @State private var saveScopeName: String = ""
+            @State private var showSaveScope = false
 
             var body: some View {
                 VStack(alignment: .leading, spacing: 12) {
+                    // Header
                     HStack {
-                        Text("Manage Scopes").font(.title2).bold()
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Filter by Folders").font(.title2).bold()
+                            Text("Select specific folders and subfolders to search within")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
                         Spacer()
                         Button("Done") { onClose() }
                             .keyboardShortcut(.defaultAction)
                     }
+
                     Divider()
 
-                    HStack(spacing: 12) {
-                        TextField("Scope name (e.g., Community A – Legal)", text: $name)
-                        TextField("Folder prefixes (comma-separated)", text: $prefixesText)
-                        Button("Add") {
-                            let prefixes = prefixesText
-                                .split(separator: ",")
-                                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                                .filter { !$0.isEmpty }
-                            guard !name.trimmingCharacters(in: .whitespaces).isEmpty,
-                                  !prefixes.isEmpty else { return }
-                            store.add(name: name, prefixes: prefixes)
-                            name = ""; prefixesText = ""
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-
-                    List {
-                        ForEach(store.scopes) { s in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(s.name).font(.headline)
-                                ForEach(s.prefixes, id: \.self) { p in
-                                    Text(p).font(.caption).foregroundStyle(.secondary)
+                    // Saved scopes section
+                    if !store.scopes.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Saved Scopes").font(.headline)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(store.scopes) { scope in
+                                        Button(action: {
+                                            selectedPaths = Set(scope.prefixes)
+                                        }) {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "folder.badge.questionmark")
+                                                    .font(.caption)
+                                                Text(scope.name)
+                                                    .font(.caption)
+                                            }
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(Color.accentColor.opacity(0.15))
+                                            .cornerRadius(8)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .contextMenu {
+                                            Button("Delete") {
+                                                if let idx = store.scopes.firstIndex(where: { $0.id == scope.id }) {
+                                                    store.remove(at: IndexSet(integer: idx))
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            .padding(.vertical, 4)
+                            .frame(height: 32)
                         }
-                        .onDelete(perform: store.remove)
+                        Divider()
+                    }
+
+                    // Quick actions
+                    HStack(spacing: 8) {
+                        Button(action: {
+                            selectedPaths = Set(indexer.indexedFolders)
+                        }) {
+                            Label("Select All Roots", systemImage: "checkmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button(action: {
+                            selectedPaths.removeAll()
+                        }) {
+                            Label("Clear Selection", systemImage: "xmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+
+                        if !selectedPaths.isEmpty {
+                            Button(action: {
+                                showSaveScope = true
+                            }) {
+                                Label("Save as Scope", systemImage: "star")
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+
+                    // Selection count
+                    if !selectedPaths.isEmpty {
+                        Text("\(selectedPaths.count) folder\(selectedPaths.count == 1 ? "" : "s") selected")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Divider()
+
+                    // Folder tree
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(folderHierarchy) { node in
+                                FolderTreeRow(
+                                    node: node,
+                                    selectedPaths: $selectedPaths,
+                                    level: 0
+                                )
+                            }
+                        }
                     }
                 }
                 .padding()
-                .frame(minWidth: 700, minHeight: 420)
+                .frame(minWidth: 700, minHeight: 500)
+                .onAppear {
+                    loadHierarchy()
+                }
+                .sheet(isPresented: $showSaveScope) {
+                    SaveScopeSheet(
+                        name: $saveScopeName,
+                        onSave: {
+                            guard !saveScopeName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                            store.add(name: saveScopeName, prefixes: Array(selectedPaths))
+                            saveScopeName = ""
+                            showSaveScope = false
+                        },
+                        onCancel: {
+                            saveScopeName = ""
+                            showSaveScope = false
+                        }
+                    )
+                }
+            }
+
+            func loadHierarchy() {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let hierarchy = indexer.discoverFolderHierarchy()
+                    DispatchQueue.main.async {
+                        self.folderHierarchy = hierarchy
+                    }
+                }
             }
         }
 
-        
+        struct SaveScopeSheet: View {
+            @Binding var name: String
+            let onSave: () -> Void
+            let onCancel: () -> Void
+
+            var body: some View {
+                VStack(spacing: 16) {
+                    Text("Save Folder Selection as Scope")
+                        .font(.title2)
+                        .bold()
+
+                    TextField("Scope name (e.g., Legal - Community A)", text: $name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 400)
+
+                    HStack(spacing: 12) {
+                        Button("Cancel") { onCancel() }
+                            .keyboardShortcut(.cancelAction)
+                        Button("Save") { onSave() }
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+                .padding(24)
+            }
+        }
+
+        struct FolderTreeRow: View {
+            @ObservedObject var node: FolderNode
+            @Binding var selectedPaths: Set<String>
+            let level: Int
+
+            var isSelected: Bool { selectedPaths.contains(node.path) }
+
+            var body: some View {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 6) {
+                        // Indent
+                        if level > 0 {
+                            Color.clear.frame(width: CGFloat(level * 20))
+                        }
+
+                        // Expand/collapse button
+                        if !node.children.isEmpty {
+                            Button(action: { node.isExpanded.toggle() }) {
+                                Image(systemName: node.isExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: 16)
+                        } else {
+                            Color.clear.frame(width: 16)
+                        }
+
+                        // Checkbox
+                        Button(action: {
+                            if isSelected {
+                                selectedPaths.remove(node.path)
+                            } else {
+                                selectedPaths.insert(node.path)
+                            }
+                        }) {
+                            Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                                .foregroundColor(isSelected ? .accentColor : .secondary)
+                        }
+                        .buttonStyle(.plain)
+
+                        // Folder icon and name
+                        Image(systemName: "folder.fill")
+                            .font(.caption)
+                            .foregroundColor(.accentColor)
+
+                        Text(node.name)
+                            .font(.system(size: 13))
+                            .lineLimit(1)
+
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8)
+                    .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+                    .cornerRadius(4)
+
+                    // Children
+                    if node.isExpanded {
+                        ForEach(node.children) { child in
+                            FolderTreeRow(
+                                node: child,
+                                selectedPaths: $selectedPaths,
+                                level: level + 1
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+
         var searchBarView: some View {
             VStack(spacing: 12) {
-                // Row 1: query + file type + scope
+                // Row 1: query + file type + folder filter
                 HStack(spacing: 12) {
                     Image(systemName: "magnifyingglass").font(.title2).foregroundColor(.secondary)
                     TextField("Search for files...", text: $searchText)
@@ -267,23 +462,32 @@ struct MainView: View {
                     .pickerStyle(.menu).frame(width: 120)
                     .onChange(of: selectedFileType) { _, _ in performSearch() }
 
-                    Picker("Scope", selection: $selectedScopeName) {
-                        Text("All").tag("All")
-                        ForEach(scopesStore.scopes) { s in
-                            Text(s.name).tag(s.name)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 260)
-                    .onChange(of: selectedScopeName) { _, _ in performSearch() }
-
                     Button {
-                        showManageScopes = true
+                        showFolderSelector = true
                     } label: {
-                        Image(systemName: "slider.horizontal.3")
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder")
+                            if selectedFolderPaths.isEmpty {
+                                Text("All Folders")
+                            } else {
+                                Text("\(selectedFolderPaths.count) selected")
+                            }
+                        }
+                        .frame(minWidth: 120)
                     }
-                    .help("Manage saved scopes")
+                    .help("Filter by specific folders")
 
+                    if !selectedFolderPaths.isEmpty {
+                        Button {
+                            selectedFolderPaths.removeAll()
+                            performSearch()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear folder filter")
+                    }
 
                     Spacer()
                 }
@@ -435,12 +639,11 @@ struct MainView: View {
                     f.fileType = self.selectedFileType
                 }
 
-                // scope from ScopesStore
-                if self.selectedScopeName != "All",
-                   let scope = self.scopesStore.scopes.first(where: { $0.name == self.selectedScopeName }) {
-                    f.folders = scope.prefixes        // limit by selected scope
+                // Use selected folder paths for filtering
+                if !self.selectedFolderPaths.isEmpty {
+                    f.folders = Array(self.selectedFolderPaths)
                 } else {
-                    f.folders = nil                   // search across all indexed folders
+                    f.folders = nil  // search across all indexed folders
                 }
 
                 f.limit = 1000
