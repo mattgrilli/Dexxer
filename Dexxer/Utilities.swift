@@ -62,8 +62,10 @@ struct TooltipModifier: ViewModifier {
     let tooltip: String
 
     func body(content: Content) -> some View {
-        content.overlay(
+        content.background(
             TooltipView(tooltip: tooltip)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
         )
     }
 }
@@ -74,6 +76,8 @@ struct TooltipView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         view.toolTip = tooltip
+        view.wantsLayer = true
+        view.layer?.backgroundColor = .clear
         return view
     }
 

@@ -1367,6 +1367,10 @@ struct MainView: View {
                             Text("\(fileCount) files indexed")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
+                        } else if isNetwork && !reachable {
+                            Text("⚠️ Permission issue - see console logs")
+                                .font(.system(size: 9))
+                                .foregroundColor(.orange)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1397,6 +1401,13 @@ struct MainView: View {
                             }
                             .buttonStyle(.plain)
                             .appTooltip("Connect: Open macOS Connect to Server dialog")
+
+                            Button(action: grantAccess) {
+                                Image(systemName: "lock.open")
+                                    .foregroundColor(.orange)
+                            }
+                            .buttonStyle(.plain)
+                            .appTooltip("Grant Access: Re-select folder to grant permissions")
                         }
 
                         Button(action: removeFolder) {
@@ -1516,6 +1527,56 @@ struct MainView: View {
                 // This opens the native macOS "Connect to Server" dialog
                 if let url = URL(string: "cifs://") {  // cifs:// opens the Connect to Server dialog
                     NSWorkspace.shared.open(url)
+                }
+            }
+
+            private func grantAccess() {
+                let alert = NSAlert()
+                alert.messageText = "Grant Folder Access"
+                alert.informativeText = """
+                This folder appears to have permission issues.
+
+                \(folder)
+
+                Common solutions:
+                1. Grant Dexxer "Full Disk Access" in System Settings > Privacy & Security
+                2. Re-select this folder to grant fresh permissions
+                3. If using ODrive/cloud storage, ensure folder is synced locally
+
+                Would you like to re-select this folder now?
+                """
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "Re-Select Folder")
+                alert.addButton(withTitle: "Open System Settings")
+                alert.addButton(withTitle: "Cancel")
+
+                let response = alert.runModal()
+
+                if response == .alertFirstButtonReturn {
+                    // Re-select folder
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = false
+                    panel.canChooseDirectories = true
+                    panel.allowsMultipleSelection = false
+                    panel.prompt = "Grant Access"
+                    panel.message = "Select \"\(folderName)\" to grant permissions"
+                    panel.directoryURL = URL(fileURLWithPath: folder)
+
+                    panel.begin { panelResponse in
+                        if panelResponse == .OK, let url = panel.url {
+                            // Save new bookmark
+                            BookmarkStore.save(path: folder, url: url)
+                            // Refresh status
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                refreshStatus()
+                            }
+                        }
+                    }
+                } else if response == .alertSecondButtonReturn {
+                    // Open System Settings to Privacy & Security
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                        NSWorkspace.shared.open(url)
+                    }
                 }
             }
 

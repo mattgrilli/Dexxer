@@ -21,8 +21,22 @@ extension FileIndexer {
         }
     }
 
-    /// Enhanced reachability check with better network detection
+    /// Enhanced reachability check with better network detection and security-scoped access
     func isReachableFolder(_ path: String) -> Bool {
+        // Try to resolve security-scoped bookmark first
+        let urlForPath: URL = BookmarkStore.resolve(path: path) ?? URL(fileURLWithPath: path)
+
+        var didStartScope = false
+        if urlForPath.startAccessingSecurityScopedResource() {
+            didStartScope = true
+        }
+
+        defer {
+            if didStartScope {
+                urlForPath.stopAccessingSecurityScopedResource()
+            }
+        }
+
         var isDir: ObjCBool = false
 
         // First check basic existence
@@ -34,7 +48,7 @@ extension FileIndexer {
 
         // Check if readable
         guard FileManager.default.isReadableFile(atPath: path) else {
-            print("⚠️ Folder '\(path)' is not readable")
+            print("⚠️ Folder '\(path)' is not readable (try granting Full Disk Access)")
             return false
         }
 
