@@ -10,15 +10,18 @@ import Foundation
 extension FileIndexer {
 
     /// Called when a volume mounts (e.g., /Volumes/TeamShare).
-    /// If any saved indexed folder is inside that volume, re-index them.
+    /// If any saved indexed folder is inside that volume, notify but don't auto-index.
     func resumeIfFolderInside(mountedVolumeURL: URL) {
         let root = mountedVolumeURL.path  // e.g., "/Volumes/TeamShare"
         // match either the root itself or subpaths under it
         let matches = indexedFolders.filter { $0 == root || $0.hasPrefix(root + "/") }
         guard !matches.isEmpty else { return }
-        if !isIndexing {
-            indexFolders(matches) { _ in }
-        }
+
+        print("📡 Network share mounted: \(root)")
+        print("   Found \(matches.count) indexed folder(s) on this share")
+
+        // Don't auto-reindex - just log the event
+        // User can manually refresh from the Folders tab if needed
     }
 
     /// Enhanced reachability check - matches what indexing uses
