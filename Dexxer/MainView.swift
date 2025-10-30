@@ -1342,7 +1342,7 @@ struct MainView: View {
                                             .font(.system(size: 8))
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Refresh: Check connection status again")
+                                    .appTooltip("Refresh connection status")
                                 }
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(reachable ? Color.green.opacity(0.18) : Color.red.opacity(0.18))
@@ -1373,21 +1373,21 @@ struct MainView: View {
 
                     Spacer()
 
-                    // Actions (Hover to see tooltips)
+                    // Actions
                     HStack(spacing: 14) {
                         Button(action: reindexFolder) {
                             Image(systemName: "arrow.clockwise")
                                 .foregroundColor(indexer.isIndexing || (isNetwork && !reachable) ? .secondary : .primary)
                         }
                         .buttonStyle(.plain)
-                        .help("Re-Index: Re-scan and update files in this folder (asks for confirmation)")
+                        .appTooltip("Re-Index: Re-scan and update all files in this folder")
                         .disabled(indexer.isIndexing || (isNetwork && !reachable))
 
                         Button(action: revealInFinder) {
                             Image(systemName: "folder.badge.gearshape")
                         }
                         .buttonStyle(.plain)
-                        .help("Show in Finder: Open this folder in Finder")
+                        .appTooltip("Show in Finder: Open this folder in Finder")
 
                         // Connect only shows for network + disconnected
                         if isNetwork && !reachable {
@@ -1396,7 +1396,7 @@ struct MainView: View {
                                     .foregroundColor(.blue)
                             }
                             .buttonStyle(.plain)
-                            .help("Connect: Open macOS Connect to Server dialog")
+                            .appTooltip("Connect: Open macOS Connect to Server dialog")
                         }
 
                         Button(action: removeFolder) {
@@ -1404,7 +1404,7 @@ struct MainView: View {
                                 .foregroundColor(.red)
                         }
                         .buttonStyle(.plain)
-                        .help("Remove: Remove this folder from index (does not delete files, asks for confirmation)")
+                        .appTooltip("Remove: Remove folder from index (files not deleted)")
                     }
                     .opacity(isHovered ? 1 : 0.6)
                     .font(.system(size: 16))
@@ -1512,20 +1512,10 @@ struct MainView: View {
             }
 
             private func openConnectToServerDialog() {
-                // Use AppleScript to open Finder's Connect to Server dialog
-                let script = """
-                tell application "Finder"
-                    activate
-                    open location "smb://"
-                end tell
-                """
-
-                if let appleScript = NSAppleScript(source: script) {
-                    var error: NSDictionary?
-                    appleScript.executeAndReturnError(&error)
-                    if let error = error {
-                        print("⚠️ Failed to open Connect to Server: \(error)")
-                    }
+                // Open Connect to Server using NSWorkspace (doesn't require Finder)
+                // This opens the native macOS "Connect to Server" dialog
+                if let url = URL(string: "cifs://") {  // cifs:// opens the Connect to Server dialog
+                    NSWorkspace.shared.open(url)
                 }
             }
 

@@ -28,18 +28,21 @@ extension FileIndexer {
         // First check basic existence
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
               isDir.boolValue else {
+            print("⚠️ Folder '\(path)' does not exist or is not a directory")
             return false
         }
 
         // Check if readable
         guard FileManager.default.isReadableFile(atPath: path) else {
+            print("⚠️ Folder '\(path)' is not readable")
             return false
         }
 
         // For network paths, do a deeper check by trying to list contents
-        if isNetworkPath(path) {
+        if isNetworkFolder(path) {
             do {
-                _ = try FileManager.default.contentsOfDirectory(atPath: path)
+                let contents = try FileManager.default.contentsOfDirectory(atPath: path)
+                print("✅ Network folder '\(path)' is reachable (found \(contents.count) items)")
                 return true
             } catch {
                 print("⚠️ Network folder '\(path)' not reachable: \(error.localizedDescription)")
@@ -47,6 +50,7 @@ extension FileIndexer {
             }
         }
 
+        print("✅ Local folder '\(path)' is reachable")
         return true
     }
 

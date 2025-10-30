@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import SwiftUI
 
 /// Blocking confirmation alert usable from anywhere (AppKit + SwiftUI contexts).
 @discardableResult
@@ -38,7 +39,7 @@ func isNetworkPath(_ path: String) -> Bool {
     return path.hasPrefix("/Volumes/")
 }
 
-/// Tiny single-line prompt (used for “Connect…”)
+/// Tiny single-line prompt (used for "Connect…")
 func promptForText(title: String, message: String, placeholder: String = "", defaultValue: String? = nil) -> String? {
     let alert = NSAlert()
     alert.messageText = title
@@ -54,4 +55,35 @@ func promptForText(title: String, message: String, placeholder: String = "", def
 
     let resp = alert.runModal()
     return resp == .alertFirstButtonReturn ? tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+}
+
+/// Custom tooltip modifier that actually works (unlike SwiftUI's .help())
+struct TooltipModifier: ViewModifier {
+    let tooltip: String
+
+    func body(content: Content) -> some View {
+        content.overlay(
+            TooltipView(tooltip: tooltip)
+        )
+    }
+}
+
+struct TooltipView: NSViewRepresentable {
+    let tooltip: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.toolTip = tooltip
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.toolTip = tooltip
+    }
+}
+
+extension View {
+    func appTooltip(_ tooltip: String) -> some View {
+        self.modifier(TooltipModifier(tooltip: tooltip))
+    }
 }
