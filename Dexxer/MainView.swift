@@ -490,21 +490,31 @@ struct MainView: View {
             @Binding var selectedPaths: Set<String>
             let level: Int
 
-            var isSelected: Bool { selectedPaths.contains(node.path) }
+            var isSelected: Bool {
+                // A folder is selected if it's explicitly selected OR any of its ancestors is selected
+                if selectedPaths.contains(node.path) {
+                    return true
+                }
+                // Check if any ancestor is selected
+                return selectedPaths.contains { ancestorPath in
+                    node.path.hasPrefix(ancestorPath + "/")
+                }
+            }
 
             var body: some View {
                 VStack(alignment: .leading, spacing: 0) {
                     Button(action: {
-                        if isSelected {
-                            // Remove this folder and all descendants
+                        // If explicitly selected, remove it
+                        if selectedPaths.contains(node.path) {
                             selectedPaths.remove(node.path)
-                            let descendants = indexer.getAllDescendantFolders(of: node.path)
-                            descendants.forEach { selectedPaths.remove($0) }
                         } else {
-                            // Add this folder and all descendants
+                            // Add this folder
                             selectedPaths.insert(node.path)
-                            let descendants = indexer.getAllDescendantFolders(of: node.path)
-                            descendants.forEach { selectedPaths.insert($0) }
+
+                            // Remove any ancestor that was selected (since we're now more specific)
+                            selectedPaths = selectedPaths.filter { ancestorPath in
+                                !node.path.hasPrefix(ancestorPath + "/")
+                            }
                         }
                     }) {
                         HStack(spacing: 6) {
