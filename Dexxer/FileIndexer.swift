@@ -501,37 +501,39 @@ class FileIndexer: ObservableObject {
 
         dbQueue.sync {
             var statement: OpaquePointer?
-            let sql = "SELECT DISTINCT path FROM files LIMIT 10000"  // Limit to prevent hanging on huge DBs
+            // Use folder_root column which is already indexed, much faster than path
+            let sql = "SELECT DISTINCT folder_root FROM files"
 
             print("  Preparing SQL query...")
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                print("  Query prepared, fetching paths...")
+                print("  Query prepared, fetching folder roots...")
 
                 while sqlite3_step(statement) == SQLITE_ROW {
                     fileCount += 1
-                    let fullPath = String(cString: sqlite3_column_text(statement, 0))
-                    let url = URL(fileURLWithPath: fullPath)
+                    let folderRoot = String(cString: sqlite3_column_text(statement, 0))
+                    folderSet.insert(folderRoot)
 
-                    // Add all parent directories up to (but not including) the root
-                    var currentURL = url.deletingLastPathComponent()
+                    // Also add parent folders for hierarchy
+                    let url = URL(fileURLWithPath: folderRoot)
+                    var currentURL = url
                     while currentURL.path != "/" && currentURL.path.count > 1 {
                         folderSet.insert(currentURL.path)
                         currentURL = currentURL.deletingLastPathComponent()
                     }
 
-                    // Progress update every 1000 files
-                    if fileCount % 1000 == 0 {
-                        print("  ... processed \(fileCount) file paths, found \(folderSet.count) folders")
+                    // Progress update every 10 folders
+                    if fileCount % 10 == 0 {
+                        print("  ... processed \(fileCount) folder roots, found \(folderSet.count) unique folders")
                     }
                 }
-                print("  Query complete, processed \(fileCount) paths")
+                print("  Query complete, processed \(fileCount) folder roots")
             } else {
                 print("  ❌ SQL query failed")
             }
             sqlite3_finalize(statement)
         }
 
-        print("📂 Found \(folderSet.count) unique folders from \(fileCount) indexed files")
+        print("📂 Found \(folderSet.count) unique folders from \(fileCount) folder roots")
         print("📁 Indexed root folders: \(indexedFolders)")
 
         // Build hierarchy from flat list
