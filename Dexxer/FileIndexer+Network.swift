@@ -21,11 +21,49 @@ extension FileIndexer {
         }
     }
 
-    /// Cheap reachability check (use in UI if you want to label disconnected folders).
+    /// Enhanced reachability check with better network detection
     func isReachableFolder(_ path: String) -> Bool {
         var isDir: ObjCBool = false
+
+        // First check basic existence
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
-              isDir.boolValue else { return false }
-        return FileManager.default.isReadableFile(atPath: path)
+              isDir.boolValue else {
+            return false
+        }
+
+        // Check if readable
+        guard FileManager.default.isReadableFile(atPath: path) else {
+            return false
+        }
+
+        // For network paths, do a deeper check by trying to list contents
+        if isNetworkPath(path) {
+            do {
+                _ = try FileManager.default.contentsOfDirectory(atPath: path)
+                return true
+            } catch {
+                print("⚠️ Network folder '\(path)' not reachable: \(error.localizedDescription)")
+                return false
+            }
+        }
+
+        return true
+    }
+
+    /// Check if folder is on a network volume (SMB, AFP, NFS, etc.)
+    func isNetworkFolder(_ path: String) -> Bool {
+        // Check standard /Volumes/ mount point
+        if path.hasPrefix("/Volumes/") {
+            return true
+        }
+
+        // Check URL resource values for network volume
+        let url = URL(fileURLWithPath: path)
+        if let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsRemovableKey]),
+           let isLocal = values.volumeIsLocal {
+            return !isLocal  // Not local = network
+        }
+
+        return false
     }
 }

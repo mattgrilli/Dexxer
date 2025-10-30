@@ -35,6 +35,7 @@ struct MainView: View {
                             Label("Re-Index All", systemImage: "arrow.clockwise")
                         }
                         .disabled(indexer.isIndexing || indexer.indexedFolders.isEmpty)
+                        .help("Re-scan all indexed folders (asks for confirmation)")
                     }
                 }
                 .listStyle(.sidebar)
@@ -1151,6 +1152,7 @@ struct MainView: View {
                     Label("Add Folder", systemImage: "plus")
                 }
                 .buttonStyle(.bordered)
+                .help("Choose a folder to add to the search index")
                 
                 if !indexer.indexedFolders.isEmpty {
                     Button(action: reindexAll) {
@@ -1158,6 +1160,7 @@ struct MainView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(indexer.isIndexing)
+                    .help("Re-scan all indexed folders (asks for confirmation)")
                 }
                 
                 Spacer()
@@ -1271,14 +1274,21 @@ struct MainView: View {
             
             // Confirm
             let ok = confirm(
-                "Re-Index All Folders?",
+                "Re-Index All \(total) Folder\(total == 1 ? "" : "s")?",
             """
-            This will re-index \(total) folder\(total == 1 ? "" : "s").
-            It may take a few minutes and will replace the existing index entries.
-            
-            Proceed?
+            This will fully rescan and update all indexed folders.
+
+            ⚠️ This operation will:
+            • Re-scan \(total) folder\(total == 1 ? "" : "s") and all their contents
+            • Replace all existing index entries
+            • Take several minutes depending on folder sizes
+            • Use significant system resources during indexing
+
+            Your actual files will not be modified.
+
+            Proceed with re-indexing all folders?
             """,
-                confirmButton: "Re-Index",
+                confirmButton: "Re-Index All",
                 cancelButton: "Cancel",
                 style: .warning
             )
@@ -1360,7 +1370,7 @@ struct MainView: View {
                                 .labelStyle(.iconOnly)
                         }
                         .buttonStyle(.plain)
-                        .help("Re-index this folder")
+                        .help("Re-scan and update files in this folder (asks for confirmation)")
                         .disabled(indexer.isIndexing || (isNetwork && !reachable))
 
                         Button(action: revealInFinder) {
@@ -1368,7 +1378,7 @@ struct MainView: View {
                                 .labelStyle(.iconOnly)
                         }
                         .buttonStyle(.plain)
-                        .help("Show in Finder")
+                        .help("Open this folder in Finder")
 
                         // Connect only shows for network + disconnected
                         if isNetwork && !reachable {
@@ -1377,7 +1387,7 @@ struct MainView: View {
                                     .labelStyle(.iconOnly)
                             }
                             .buttonStyle(.plain)
-                            .help("Connect to SMB/NFS share")
+                            .help("Connect to this network share (SMB/AFP/NFS)")
                         }
 
                         Button(action: removeFolder) {
@@ -1385,9 +1395,10 @@ struct MainView: View {
                                 .foregroundColor(.red)
                         }
                         .buttonStyle(.plain)
-                        .help("Remove folder")
+                        .help("Remove this folder from index (does not delete files, asks for confirmation)")
                     }
                     .opacity(isHovered ? 1 : 0.3)
+                    .font(.system(size: 14))
                 }
                 .padding()
                 .background(isHovered ? Color(nsColor: .controlAccentColor).opacity(0.05) : Color.clear)
@@ -1399,7 +1410,7 @@ struct MainView: View {
             }
 
             private func refreshStatus() {
-                isNetwork = isNetworkPath(folder)
+                isNetwork = indexer.isNetworkFolder(folder)
                 reachable = indexer.isReachableFolder(folder)
                 updateFileCount()
             }
@@ -1422,16 +1433,23 @@ struct MainView: View {
                     return
                 }
                 let ok = confirm(
-                    "Re-Index “\(folderName)”?",
+                    "Re-Index "\(folderName)"?",
                     """
-                    This will fully rescan:
+                    This will fully rescan and update all files in:
                     \(folder)
 
-                    Existing index entries for this folder will be replaced. This may take a few minutes.
+                    ⚠️ This operation will:
+                    • Replace existing index entries for this folder
+                    • Scan all files (may take several minutes for large folders)
+                    • Use system resources during indexing
 
-                    Proceed?
+                    Your actual files will not be modified.
+
+                    Proceed with re-indexing?
                     """,
-                    confirmButton: "Re-Index"
+                    confirmButton: "Re-Index",
+                    cancelButton: "Cancel",
+                    style: .warning
                 )
                 if !ok { return }
                 indexer.indexFolders([folder]) { _ in updateFileCount() }
@@ -1457,10 +1475,22 @@ struct MainView: View {
 
             private func removeFolder() {
                 let alert = NSAlert()
-                alert.messageText = "Remove Folder?"
-                alert.informativeText = "This will remove \"\(folderName)\" from your index. Files will not be deleted."
+                alert.messageText = "Remove "\(folderName)" from Index?"
+                alert.informativeText = """
+                This will remove this folder from your search index:
+                \(folder)
+
+                ⚠️ This action will:
+                • Remove all indexed file entries for this folder
+                • Stop searching within this folder
+                • NOT delete any actual files (they remain on disk)
+
+                You can always add it back later.
+
+                Remove from index?
+                """
                 alert.alertStyle = .warning
-                alert.addButton(withTitle: "Remove")
+                alert.addButton(withTitle: "Remove from Index")
                 alert.addButton(withTitle: "Cancel")
                 if alert.runModal() == .alertFirstButtonReturn {
                     indexer.removeFolder(folder)

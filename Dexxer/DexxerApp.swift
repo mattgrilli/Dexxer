@@ -78,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(statsItem)
 
         // Network summary
-        let networkFolders = indexer.indexedFolders.filter { isNetworkPath($0) }
+        let networkFolders = indexer.indexedFolders.filter { indexer.isNetworkFolder($0) }
         if !networkFolders.isEmpty {
             let connected = networkFolders.filter { indexer.isReachableFolder($0) }.count
             let disconnected = networkFolders.count - connected
