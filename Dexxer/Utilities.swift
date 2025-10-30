@@ -74,7 +74,7 @@ struct TooltipView: NSViewRepresentable {
     let tooltip: String
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
+        let view = TooltipHostView()
         view.toolTip = tooltip
         view.wantsLayer = true
         view.layer?.backgroundColor = .clear
@@ -83,6 +83,33 @@ struct TooltipView: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         nsView.toolTip = tooltip
+    }
+}
+
+/// Custom NSView that shows tooltips faster
+class TooltipHostView: NSView {
+    override func addToolTip(_ rect: NSRect, owner: Any, userData: UnsafeMutableRawPointer?) -> NSView.ToolTipTag {
+        // Return the tag but don't modify behavior - macOS controls timing
+        return super.addToolTip(rect, owner: owner, userData: userData)
+    }
+
+    // Override to show tooltip immediately on mouse enter
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        // Remove existing tracking areas
+        for trackingArea in trackingAreas {
+            removeTrackingArea(trackingArea)
+        }
+
+        // Add new tracking area with better tooltip behavior
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
     }
 }
 

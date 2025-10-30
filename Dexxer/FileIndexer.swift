@@ -464,6 +464,8 @@ class FileIndexer: ObservableObject {
     func discoverFolderHierarchy() -> [FolderNode] {
         var folderSet = Set<String>()
 
+        print("🔍 Discovering folder hierarchy...")
+
         dbQueue.sync {
             var statement: OpaquePointer?
             let sql = "SELECT DISTINCT path FROM files ORDER BY path"
@@ -484,6 +486,9 @@ class FileIndexer: ObservableObject {
             sqlite3_finalize(statement)
         }
 
+        print("📂 Found \(folderSet.count) unique folders from indexed files")
+        print("📁 Indexed root folders: \(indexedFolders)")
+
         // Build hierarchy from flat list
         return buildHierarchy(from: Array(folderSet))
     }
@@ -493,21 +498,39 @@ class FileIndexer: ObservableObject {
         var nodeMap: [String: FolderNode] = [:]
         var rootNodes: [FolderNode] = []
 
-        // Sort paths to ensure parents are processed before children
-        let sortedPaths = paths.sorted()
+        // Sort paths by depth (shallowest first) to ensure parents are created before children
+        let sortedPaths = paths.sorted { path1, path2 in
+            let depth1 = path1.components(separatedBy: "/").count
+            let depth2 = path2.components(separatedBy: "/").count
+            if depth1 == depth2 {
+                return path1 < path2
+            }
+            return depth1 < depth2
+        }
 
         for path in sortedPaths {
             let url = URL(fileURLWithPath: path)
             let parentPath = url.deletingLastPathComponent().path
 
             // Create or get the current node
-            let node = nodeMap[path] ?? FolderNode(path: path, name: url.lastPathComponent)
-            nodeMap[path] = node
+            if nodeMap[path] == nil {
+                nodeMap[path] = FolderNode(path: path, name: url.lastPathComponent)
+            }
+            let node = nodeMap[path]!
 
             // Check if this is a root folder (in indexedFolders)
             if indexedFolders.contains(path) {
-                rootNodes.append(node)
-            } else if let parentNode = nodeMap[parentPath] {
+                if !rootNodes.contains(where: { $0.path == path }) {
+                    rootNodes.append(node)
+                    print("  ✓ Added root: \(path)")
+                }
+            } else if parentPath != "/" {
+                // Create parent if it doesn't exist
+                if nodeMap[parentPath] == nil {
+                    nodeMap[parentPath] = FolderNode(path: parentPath, name: URL(fileURLWithPath: parentPath).lastPathComponent)
+                }
+                let parentNode = nodeMap[parentPath]!
+
                 // Add as child to parent
                 if !parentNode.children.contains(where: { $0.path == path }) {
                     parentNode.children.append(node)
@@ -515,6 +538,7 @@ class FileIndexer: ObservableObject {
             }
         }
 
+        print("🌲 Built hierarchy with \(rootNodes.count) root nodes")
         return rootNodes.sorted { $0.path < $1.path }
     }
 }
