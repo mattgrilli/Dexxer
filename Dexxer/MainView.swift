@@ -1315,6 +1315,7 @@ struct MainView: View {
             @State private var fileCount: Int = 0
             @State private var reachable: Bool = false
             @State private var isNetwork: Bool = false
+            @State private var isRefreshing: Bool = false
 
             var folderName: String { URL(fileURLWithPath: folder).lastPathComponent }
 
@@ -1340,9 +1341,12 @@ struct MainView: View {
                                     Button(action: refreshStatus) {
                                         Image(systemName: "arrow.clockwise")
                                             .font(.system(size: 8))
+                                            .rotationEffect(.degrees(isRefreshing ? 360 : 0))
+                                            .animation(isRefreshing ? .linear(duration: 0.5).repeatCount(3, autoreverses: false) : .default, value: isRefreshing)
                                     }
                                     .buttonStyle(.plain)
                                     .appTooltip("Refresh connection status")
+                                    .disabled(isRefreshing)
                                 }
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(reachable ? Color.green.opacity(0.18) : Color.red.opacity(0.18))
@@ -1430,11 +1434,26 @@ struct MainView: View {
             }
 
             private func refreshStatus() {
-                isNetwork = indexer.isNetworkFolder(folder)
-                reachable = indexer.isReachableFolder(folder)
-                print("📁 Folder: \(folder)")
-                print("   isNetwork: \(isNetwork), reachable: \(reachable)")
-                updateFileCount()
+                isRefreshing = true
+
+                // Run check on background thread
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let network = indexer.isNetworkFolder(folder)
+                    let reach = indexer.isReachableFolder(folder)
+
+                    DispatchQueue.main.async {
+                        self.isNetwork = network
+                        self.reachable = reach
+                        print("📁 Folder: \(folder)")
+                        print("   isNetwork: \(network), reachable: \(reach)")
+                        self.updateFileCount()
+
+                        // Stop spinning after animation completes
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            self.isRefreshing = false
+                        }
+                    }
+                }
             }
 
             private func updateFileCount() {
