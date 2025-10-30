@@ -492,48 +492,45 @@ class FileIndexer: ObservableObject {
 
     // MARK: - Folder Discovery
 
-    /// Returns a hierarchical structure of all indexed folders and their immediate subfolders
+    /// Returns a hierarchical structure of all indexed folders and their subfolders
     func discoverFolderHierarchy() -> [FolderNode] {
         var folderSet = Set<String>()
-        var fileCount = 0
 
-        print("🔍 Discovering folder hierarchy...")
+        print("🔍 Extracting folder hierarchy from indexed files...")
 
         dbQueue.sync {
             var statement: OpaquePointer?
-            // Use folder_root column which is already indexed, much faster than path
-            let sql = "SELECT DISTINCT folder_root FROM files"
+            // Extract directory path from each file path using SQLite string functions
+            // This is much faster than processing in Swift
+            let sql = """
+            SELECT DISTINCT
+                substr(path, 1, length(path) - length(name) - 1) as folder_path
+            FROM files
+            WHERE folder_path != ''
+            """
 
-            print("  Preparing SQL query...")
+            print("  Preparing SQL query to extract unique folder paths...")
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                print("  Query prepared, fetching folder roots...")
+                print("  Query prepared, fetching unique folders...")
 
+                var count = 0
                 while sqlite3_step(statement) == SQLITE_ROW {
-                    fileCount += 1
-                    let folderRoot = String(cString: sqlite3_column_text(statement, 0))
-                    folderSet.insert(folderRoot)
+                    let folderPath = String(cString: sqlite3_column_text(statement, 0))
+                    folderSet.insert(folderPath)
+                    count += 1
 
-                    // Also add parent folders for hierarchy
-                    let url = URL(fileURLWithPath: folderRoot)
-                    var currentURL = url
-                    while currentURL.path != "/" && currentURL.path.count > 1 {
-                        folderSet.insert(currentURL.path)
-                        currentURL = currentURL.deletingLastPathComponent()
-                    }
-
-                    // Progress update every 10 folders
-                    if fileCount % 10 == 0 {
-                        print("  ... processed \(fileCount) folder roots, found \(folderSet.count) unique folders")
+                    if count % 100 == 0 {
+                        print("  ... extracted \(count) unique folder paths")
                     }
                 }
-                print("  Query complete, processed \(fileCount) folder roots")
+                print("  ✅ Query complete, found \(folderSet.count) unique folders")
             } else {
                 print("  ❌ SQL query failed")
             }
             sqlite3_finalize(statement)
         }
 
-        print("📂 Found \(folderSet.count) unique folders from \(fileCount) folder roots")
+        print("📂 Total unique folders: \(folderSet.count)")
         print("📁 Indexed root folders: \(indexedFolders)")
 
         // Build hierarchy from flat list
