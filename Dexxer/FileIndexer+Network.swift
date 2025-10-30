@@ -54,6 +54,7 @@ extension FileIndexer {
     func isNetworkFolder(_ path: String) -> Bool {
         // Check standard /Volumes/ mount point
         if path.hasPrefix("/Volumes/") {
+            print("🌐 \(path) detected as network (starts with /Volumes/)")
             return true
         }
 
@@ -61,9 +62,12 @@ extension FileIndexer {
         let url = URL(fileURLWithPath: path)
         if let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsRemovableKey]),
            let isLocal = values.volumeIsLocal {
-            return !isLocal  // Not local = network
+            let isNet = !isLocal
+            print("🌐 \(path) volumeIsLocal=\(isLocal), detected as \(isNet ? "network" : "local")")
+            return isNet  // Not local = network
         }
 
+        print("🌐 \(path) - couldn't determine, defaulting to local")
         return false
     }
 }

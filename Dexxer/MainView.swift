@@ -914,7 +914,7 @@ struct MainView: View {
     struct SettingsContentView: View {
         @ObservedObject var indexer: FileIndexer
         @State private var dbSize: String = "Calculating..."
-        
+
         var body: some View {
             Form {
                 Section("Database") {
@@ -928,14 +928,14 @@ struct MainView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
-                    
+
                     Button("Open Database Location") {
                         let homeDir = FileManager.default.homeDirectoryForCurrentUser
-                        NSWorkspace.shared.selectFile(homeDir.appendingPathComponent(".local_file_indexer.db").path,
+                        NSWorkspace.shared.selectFile(homeDir.appendingPathComponent(".dexxer.db").path,
                                                       inFileViewerRootedAtPath: homeDir.path)
                     }
                 }
-                
+
                 Section("Indexing") {
                     let stats = indexer.getStats()
                     LabeledContent("Total Files") {
@@ -947,37 +947,37 @@ struct MainView: View {
                     LabeledContent("Folders Indexed") {
                         Text("\(indexer.indexedFolders.count)")
                     }
-                    
+
                     Button("Clear All Index Data") {
                         clearAllData()
                     }
                     .foregroundColor(.red)
                 }
-                
+
                 Section("About") {
                     let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
                     let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
                     LabeledContent("Version", value: "\(version) (\(build))")
 
                     LabeledContent("Created by", value: "Matt Grilli")
-                    
+
                     Button("View on GitHub") {
-                        // Add your GitHub URL here
+                        if let url = URL(string: "https://github.com/mattgrilli/Dexxer") {
+                            NSWorkspace.shared.open(url)
+                        }
                     }
-                    .disabled(true)
                 }
             }
             .formStyle(.grouped)
-            .navigationTitle("Settings")
             .onAppear {
                 calculateDBSize()
             }
         }
-        
+
         private func calculateDBSize() {
             DispatchQueue.global().async {
                 let homeDir = FileManager.default.homeDirectoryForCurrentUser
-                let dbPath = homeDir.appendingPathComponent(".local_file_indexer.db").path
+                let dbPath = homeDir.appendingPathComponent(".dexxer.db").path
                 
                 if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
                    let size = attrs[.size] as? Int64 {
@@ -1366,28 +1366,27 @@ struct MainView: View {
                     // Actions
                     HStack(spacing: 12) {
                         Button(action: reindexFolder) {
-                            Label("Re-Index", systemImage: "arrow.clockwise")
-                                .labelStyle(.iconOnly)
+                            Image(systemName: "arrow.clockwise")
+                                .foregroundColor(indexer.isIndexing || (isNetwork && !reachable) ? .secondary : .primary)
                         }
                         .buttonStyle(.plain)
-                        .help("Re-scan and update files in this folder (asks for confirmation)")
+                        .help("Re-Index: Re-scan and update files in this folder (asks for confirmation)")
                         .disabled(indexer.isIndexing || (isNetwork && !reachable))
 
                         Button(action: revealInFinder) {
-                            Label("Show in Finder", systemImage: "folder.badge.gearshape")
-                                .labelStyle(.iconOnly)
+                            Image(systemName: "folder.badge.gearshape")
                         }
                         .buttonStyle(.plain)
-                        .help("Open this folder in Finder")
+                        .help("Show in Finder: Open this folder in Finder")
 
                         // Connect only shows for network + disconnected
                         if isNetwork && !reachable {
                             Button(action: connectToServer) {
-                                Label("Connect…", systemImage: "bolt.horizontal.icloud")
-                                    .labelStyle(.iconOnly)
+                                Image(systemName: "bolt.horizontal.icloud")
+                                    .foregroundColor(.blue)
                             }
                             .buttonStyle(.plain)
-                            .help("Connect to this network share (SMB/AFP/NFS)")
+                            .help("Connect: Connect to this network share (SMB/AFP/NFS)")
                         }
 
                         Button(action: removeFolder) {
@@ -1395,10 +1394,10 @@ struct MainView: View {
                                 .foregroundColor(.red)
                         }
                         .buttonStyle(.plain)
-                        .help("Remove this folder from index (does not delete files, asks for confirmation)")
+                        .help("Remove: Remove this folder from index (does not delete files, asks for confirmation)")
                     }
-                    .opacity(isHovered ? 1 : 0.3)
-                    .font(.system(size: 14))
+                    .opacity(isHovered ? 1 : 0.5)
+                    .font(.system(size: 15))
                 }
                 .padding()
                 .background(isHovered ? Color(nsColor: .controlAccentColor).opacity(0.05) : Color.clear)
@@ -1412,6 +1411,8 @@ struct MainView: View {
             private func refreshStatus() {
                 isNetwork = indexer.isNetworkFolder(folder)
                 reachable = indexer.isReachableFolder(folder)
+                print("📁 Folder: \(folder)")
+                print("   isNetwork: \(isNetwork), reachable: \(reachable)")
                 updateFileCount()
             }
 
