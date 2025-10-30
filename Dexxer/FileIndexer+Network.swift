@@ -21,7 +21,7 @@ extension FileIndexer {
         }
     }
 
-    /// Enhanced reachability check with better network detection and security-scoped access
+    /// Enhanced reachability check - matches what indexing uses
     func isReachableFolder(_ path: String) -> Bool {
         // Try to resolve security-scoped bookmark first
         let urlForPath: URL = BookmarkStore.resolve(path: path) ?? URL(fileURLWithPath: path)
@@ -46,25 +46,19 @@ extension FileIndexer {
             return false
         }
 
-        // Check if readable
-        guard FileManager.default.isReadableFile(atPath: path) else {
-            print("⚠️ Folder '\(path)' is not readable (try granting Full Disk Access)")
+        // Test reachability the same way indexing does: try to enumerate
+        // Note: isReadableFile() gives false negatives for ODrive/virtual filesystems
+        let fileManager = FileManager.default
+        guard let _ = fileManager.enumerator(
+            at: URL(fileURLWithPath: path),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            print("⚠️ Folder '\(path)' cannot be enumerated (permission denied)")
             return false
         }
 
-        // For network paths, do a deeper check by trying to list contents
-        if isNetworkFolder(path) {
-            do {
-                let contents = try FileManager.default.contentsOfDirectory(atPath: path)
-                print("✅ Network folder '\(path)' is reachable (found \(contents.count) items)")
-                return true
-            } catch {
-                print("⚠️ Network folder '\(path)' not reachable: \(error.localizedDescription)")
-                return false
-            }
-        }
-
-        print("✅ Local folder '\(path)' is reachable")
+        print("✅ Folder '\(path)' is reachable and enumerable")
         return true
     }
 

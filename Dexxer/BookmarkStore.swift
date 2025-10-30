@@ -36,8 +36,9 @@ enum BookmarkStore {
         }
         do {
             if #available(macOS 10.15, *) {
-                // New API (recommended)
-                return try NSKeyedUnarchiver.unarchivedObject(ofClass: NSDictionary.self, from: blob) as? [String: Data] ?? [:]
+                // New API with proper allowed classes
+                let classes = [NSDictionary.self, NSString.self, NSData.self]
+                return try NSKeyedUnarchiver.unarchivedObject(ofClasses: classes, from: blob) as? [String: Data] ?? [:]
             } else {
                 // Fallback for older systems
                 return try (NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(blob) as? [String: Data]) ?? [:]
