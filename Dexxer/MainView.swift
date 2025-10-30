@@ -450,7 +450,12 @@ struct MainView: View {
             }
 
             func loadChildren() {
-                guard children.isEmpty && !isLoadingChildren else { return }
+                guard !isLoadingChildren else { return }
+
+                // If children already loaded, don't reload
+                if !children.isEmpty {
+                    return
+                }
 
                 isLoadingChildren = true
 
@@ -462,6 +467,19 @@ struct MainView: View {
                         self.children = childNodes
                         self.isLoadingChildren = false
                     }
+                }
+            }
+
+            func toggleExpand() {
+                if isExpanded {
+                    // Just collapse, don't clear children
+                    isExpanded = false
+                } else {
+                    // Expand and load if needed
+                    if children.isEmpty {
+                        loadChildren()
+                    }
+                    isExpanded = true
                 }
             }
         }
@@ -491,14 +509,7 @@ struct MainView: View {
 
                             // Expand/collapse button
                             Button(action: {
-                                if node.isExpanded {
-                                    node.isExpanded = false
-                                } else {
-                                    if node.children.isEmpty {
-                                        node.loadChildren()
-                                    }
-                                    node.isExpanded = true
-                                }
+                                node.toggleExpand()
                             }) {
                                 if node.isLoadingChildren {
                                     ProgressView()

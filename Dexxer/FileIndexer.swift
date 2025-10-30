@@ -496,28 +496,28 @@ class FileIndexer: ObservableObject {
     func getImmediateSubfolders(of parentPath: String) -> [String] {
         var subfolders = Set<String>()
 
+        print("📂 Getting subfolders of: \(parentPath)")
+
         dbQueue.sync {
             var statement: OpaquePointer?
-            // Get distinct folder paths, then filter in Swift for immediate children
-            let sql = """
-            SELECT DISTINCT
-                substr(path, 1, length(path) - length(name) - 1) as folder_path
-            FROM files
-            WHERE folder_path LIKE ? || '%'
-            """
+            // Get all file paths under this parent folder
+            let sql = "SELECT DISTINCT path FROM files WHERE path LIKE ? || '/%'"
 
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_text(statement, 1, (parentPath as NSString).utf8String, -1, nil)
 
                 while sqlite3_step(statement) == SQLITE_ROW {
-                    let folderPath = String(cString: sqlite3_column_text(statement, 0))
+                    let filePath = String(cString: sqlite3_column_text(statement, 0))
 
-                    // Only include immediate children (not grandchildren)
-                    if folderPath != parentPath && folderPath.hasPrefix(parentPath + "/") {
-                        let remainder = String(folderPath.dropFirst(parentPath.count + 1))
-                        // If no more slashes, it's an immediate child
-                        if !remainder.contains("/") {
-                            subfolders.insert(folderPath)
+                    // Extract the immediate subfolder from this file path
+                    if filePath.hasPrefix(parentPath + "/") {
+                        let remainder = String(filePath.dropFirst(parentPath.count + 1))
+
+                        // Get the first path component (immediate child folder)
+                        if let firstSlash = remainder.firstIndex(of: "/") {
+                            let immediateChild = String(remainder[..<firstSlash])
+                            let childPath = parentPath + "/" + immediateChild
+                            subfolders.insert(childPath)
                         }
                     }
                 }
@@ -525,7 +525,9 @@ class FileIndexer: ObservableObject {
             sqlite3_finalize(statement)
         }
 
-        return Array(subfolders).sorted()
+        let result = Array(subfolders).sorted()
+        print("  Found \(result.count) immediate subfolders")
+        return result
     }
 
     /// Returns a flat list of all unique folder paths from indexed files (for search fallback)
