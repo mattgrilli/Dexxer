@@ -90,9 +90,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
 
         if indexer.isIndexing {
-            let indexingItem = NSMenuItem(title: "⏳ Indexing... \(indexer.indexProgress) files", action: nil, keyEquivalent: "")
+            let statusText = indexer.isCancellingIndex ? "⏳ Cancelling..." : "⏳ Indexing... \(indexer.indexProgress) files"
+            let indexingItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
             indexingItem.isEnabled = false
             menu.addItem(indexingItem)
+
+            if !indexer.isCancellingIndex {
+                menu.addItem(NSMenuItem(title: "🛑 Cancel Indexing", action: #selector(cancelIndexing), keyEquivalent: ""))
+            }
         } else {
             let re = NSMenuItem(title: "🔄 Quick Re-Index", action: #selector(quickReindex), keyEquivalent: "")
             menu.addItem(re)
@@ -163,6 +168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.sendNotification(title: "Dexxer", body: "Indexed \(count) files!")
             }
         }
+    }
+
+    @objc func cancelIndexing() {
+        indexer.cancelIndexing()
     }
 
     @objc func showAbout() {

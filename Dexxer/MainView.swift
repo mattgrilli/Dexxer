@@ -1169,9 +1169,18 @@ struct MainView: View {
                     HStack(spacing: 8) {
                         ProgressView()
                             .scaleEffect(0.8)
-                        Text("Indexing... \(indexer.indexProgress) files")
+                        Text(indexer.isCancellingIndex ? "Cancelling..." : "Indexing... \(indexer.indexProgress) files")
                             .font(.caption)
                             .foregroundColor(.secondary)
+
+                        Button(action: {
+                            indexer.cancelIndexing()
+                        }) {
+                            Text("Cancel")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(indexer.isCancellingIndex)
                     }
                 }
             }

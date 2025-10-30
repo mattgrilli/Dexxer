@@ -17,6 +17,8 @@ class FileIndexer: ObservableObject {
     @Published var indexedFolders: [String] = []
     @Published var isIndexing = false
     @Published var indexProgress: Int = 0
+    @Published var isCancellingIndex = false
+    private var shouldCancelIndexing = false
     
     init() {
         // Use Dexxer-specific database and config
@@ -103,15 +105,27 @@ class FileIndexer: ObservableObject {
         }
     }
     
+    func cancelIndexing() {
+        print("⚠️ User requested cancellation")
+        shouldCancelIndexing = true
+        DispatchQueue.main.async {
+            self.isCancellingIndex = true
+        }
+    }
+
     func indexFolders(_ folders: [String]? = nil, progressCallback: ((Int) -> Void)? = nil) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            
+
             print("🔍 Starting indexing...")
-            
+
+            // Reset cancellation flag at start
+            self.shouldCancelIndexing = false
+
             DispatchQueue.main.async {
                 self.isIndexing = true
                 self.indexProgress = 0
+                self.isCancellingIndex = false
             }
             
             let foldersToIndex = folders ?? self.indexedFolders
@@ -139,6 +153,12 @@ class FileIndexer: ObservableObject {
             """
             
             for folderRoot in foldersToIndex {
+                // Check for cancellation between folders
+                if self.shouldCancelIndexing {
+                    print("🛑 Indexing cancelled by user")
+                    break
+                }
+
                 print("📂 Indexing: \(folderRoot)")
                 
                 
@@ -189,6 +209,12 @@ class FileIndexer: ObservableObject {
                 var fileCount = 0
                 
                 for case let fileURL as URL in enumerator {
+                    // Check for cancellation during file scanning
+                    if self.shouldCancelIndexing {
+                        print("   🛑 Cancelled while scanning files")
+                        break
+                    }
+
                     fileCount += 1
                     if fileCount % 100 == 0 {
                         print("   ... scanned \(fileCount) items")
@@ -239,13 +265,19 @@ class FileIndexer: ObservableObject {
                 }
             }
             
-            print("✅ Indexing complete! Total files: \(totalFiles)")
-            
+            if self.shouldCancelIndexing {
+                print("🛑 Indexing cancelled! Indexed \(totalFiles) files before cancellation")
+            } else {
+                print("✅ Indexing complete! Total files: \(totalFiles)")
+            }
+
             DispatchQueue.main.async {
                 self.isIndexing = false
+                self.isCancellingIndex = false
                 self.indexProgress = totalFiles
                 progressCallback?(totalFiles)
             }
+            self.shouldCancelIndexing = false
         }
     }
     
