@@ -1433,7 +1433,7 @@ struct MainView: View {
                     return
                 }
                 let ok = confirm(
-                    "Re-Index "\(folderName)"?",
+                    "Re-Index \"\(folderName)\"?",
                     """
                     This will fully rescan and update all files in:
                     \(folder)
@@ -1475,7 +1475,7 @@ struct MainView: View {
 
             private func removeFolder() {
                 let alert = NSAlert()
-                alert.messageText = "Remove "\(folderName)" from Index?"
+                alert.messageText = "Remove \"\(folderName)\" from Index?"
                 alert.informativeText = """
                 This will remove this folder from your search index:
                 \(folder)
