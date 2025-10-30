@@ -208,18 +208,13 @@ struct MainView: View {
             @Binding var selectedPaths: Set<String>
             var onClose: () -> Void
 
-            @State private var allFolders: [String] = []
+            @State private var rootFolders: [LazyFolderNode] = []
             @State private var searchText: String = ""
+            @State private var searchResults: [String] = []
             @State private var saveScopeName: String = ""
             @State private var showSaveScope = false
             @State private var isLoading = true
-
-            var filteredFolders: [String] {
-                if searchText.isEmpty {
-                    return allFolders
-                }
-                return allFolders.filter { $0.localizedCaseInsensitiveContains(searchText) }
-            }
+            @State private var isSearching = false
 
             var body: some View {
                 VStack(alignment: .leading, spacing: 12) {
@@ -227,7 +222,7 @@ struct MainView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Filter by Folders").font(.title2).bold()
-                            Text("Select specific folders and subfolders to search within")
+                            Text("Select specific folders to search within")
                                 .font(.caption).foregroundColor(.secondary)
                         }
                         Spacer()
@@ -310,16 +305,35 @@ struct MainView: View {
                     }
 
                     // Search field
-                    TextField("Search folders...", text: $searchText)
-                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundColor(.secondary)
+                        TextField("Search folders (or use tree below)...", text: $searchText)
+                            .textFieldStyle(.plain)
+                            .onChange(of: searchText) { _, newValue in
+                                performSearch(newValue)
+                            }
+                        if !searchText.isEmpty {
+                            Button(action: { searchText = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(8)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .cornerRadius(8)
 
-                    Text("\(filteredFolders.count) of \(allFolders.count) folders")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    if isSearching {
+                        Text("Found \(searchResults.count) matching folders")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
 
                     Divider()
 
-                    // Folder list (flat, fast, searchable)
+                    // Lazy-loading tree or search results
                     ScrollView {
                         if isLoading {
                             VStack(spacing: 16) {
@@ -330,23 +344,10 @@ struct MainView: View {
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .padding()
-                        } else if allFolders.isEmpty {
-                            VStack(spacing: 16) {
-                                Image(systemName: "folder.badge.questionmark")
-                                    .font(.system(size: 48))
-                                    .foregroundColor(.secondary)
-                                Text("No Folders Found")
-                                    .font(.title3)
-                                    .bold()
-                                Text("Index some folders first from the Folders tab")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .padding()
-                        } else {
+                        } else if isSearching {
+                            // Search results (flat list)
                             LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(filteredFolders, id: \.self) { folder in
+                                ForEach(searchResults, id: \.self) { folder in
                                     FolderListRow(
                                         folder: folder,
                                         isSelected: selectedPaths.contains(folder),
@@ -357,6 +358,18 @@ struct MainView: View {
                                                 selectedPaths.insert(folder)
                                             }
                                         }
+                                    )
+                                }
+                            }
+                        } else {
+                            // Lazy-loading tree
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(rootFolders) { node in
+                                    LazyFolderTreeRow(
+                                        node: node,
+                                        indexer: indexer,
+                                        selectedPaths: $selectedPaths,
+                                        level: 0
                                     )
                                 }
                             }
@@ -386,15 +399,152 @@ struct MainView: View {
             }
 
             func loadHierarchy() {
-                print("🔄 FolderSelectionView: Starting to load folders...")
+                print("🔄 FolderSelectionView: Loading root folders...")
                 isLoading = true
 
+                DispatchQueue.main.async {
+                    // Just load the indexed root folders - instant!
+                    self.rootFolders = indexer.indexedFolders.map { path in
+                        LazyFolderNode(path: path, indexer: indexer)
+                    }
+                    print("📊 Loaded \(self.rootFolders.count) root folders")
+                    self.isLoading = false
+                }
+            }
+
+            func performSearch(_ query: String) {
+                let trimmed = query.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty {
+                    isSearching = false
+                    searchResults = []
+                    return
+                }
+
+                isSearching = true
+
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let folders = indexer.getAllFolders()
+                    let allFolders = indexer.getAllFolders()
+                    let results = allFolders.filter { $0.localizedCaseInsensitiveContains(trimmed) }.sorted()
+
                     DispatchQueue.main.async {
-                        print("📊 FolderSelectionView: Loaded \(folders.count) folders")
-                        self.allFolders = folders.sorted()
-                        self.isLoading = false
+                        self.searchResults = results
+                    }
+                }
+            }
+        }
+
+        // Lazy-loading folder node
+        class LazyFolderNode: Identifiable, ObservableObject {
+            let id = UUID()
+            let path: String
+            let name: String
+            @Published var children: [LazyFolderNode] = []
+            @Published var isExpanded: Bool = false
+            @Published var isLoadingChildren: Bool = false
+            private let indexer: FileIndexer
+
+            init(path: String, indexer: FileIndexer) {
+                self.path = path
+                self.name = URL(fileURLWithPath: path).lastPathComponent
+                self.indexer = indexer
+            }
+
+            func loadChildren() {
+                guard children.isEmpty && !isLoadingChildren else { return }
+
+                isLoadingChildren = true
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let subfolderPaths = self.indexer.getImmediateSubfolders(of: self.path)
+                    let childNodes = subfolderPaths.map { LazyFolderNode(path: $0, indexer: self.indexer) }
+
+                    DispatchQueue.main.async {
+                        self.children = childNodes
+                        self.isLoadingChildren = false
+                    }
+                }
+            }
+        }
+
+        struct LazyFolderTreeRow: View {
+            @ObservedObject var node: LazyFolderNode
+            let indexer: FileIndexer
+            @Binding var selectedPaths: Set<String>
+            let level: Int
+
+            var isSelected: Bool { selectedPaths.contains(node.path) }
+
+            var body: some View {
+                VStack(alignment: .leading, spacing: 0) {
+                    Button(action: {
+                        if isSelected {
+                            selectedPaths.remove(node.path)
+                        } else {
+                            selectedPaths.insert(node.path)
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            // Indent
+                            if level > 0 {
+                                Color.clear.frame(width: CGFloat(level * 20))
+                            }
+
+                            // Expand/collapse button
+                            Button(action: {
+                                if node.isExpanded {
+                                    node.isExpanded = false
+                                } else {
+                                    if node.children.isEmpty {
+                                        node.loadChildren()
+                                    }
+                                    node.isExpanded = true
+                                }
+                            }) {
+                                if node.isLoadingChildren {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                        .frame(width: 16, height: 16)
+                                } else {
+                                    Image(systemName: node.isExpanded ? "chevron.down" : "chevron.right")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 16)
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            // Checkbox
+                            Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                                .foregroundColor(isSelected ? .accentColor : .secondary)
+
+                            // Folder icon and name
+                            Image(systemName: "folder.fill")
+                                .font(.caption)
+                                .foregroundColor(.accentColor)
+
+                            Text(node.name)
+                                .font(.system(size: 13))
+                                .lineLimit(1)
+
+                            Spacer()
+                        }
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+
+                    // Children
+                    if node.isExpanded {
+                        ForEach(node.children) { child in
+                            LazyFolderTreeRow(
+                                node: child,
+                                indexer: indexer,
+                                selectedPaths: $selectedPaths,
+                                level: level + 1
+                            )
+                        }
                     }
                 }
             }
