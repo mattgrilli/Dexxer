@@ -208,10 +208,18 @@ struct MainView: View {
             @Binding var selectedPaths: Set<String>
             var onClose: () -> Void
 
-            @State private var folderHierarchy: [FolderNode] = []
+            @State private var allFolders: [String] = []
+            @State private var searchText: String = ""
             @State private var saveScopeName: String = ""
             @State private var showSaveScope = false
             @State private var isLoading = true
+
+            var filteredFolders: [String] {
+                if searchText.isEmpty {
+                    return allFolders
+                }
+                return allFolders.filter { $0.localizedCaseInsensitiveContains(searchText) }
+            }
 
             var body: some View {
                 VStack(alignment: .leading, spacing: 12) {
@@ -301,23 +309,28 @@ struct MainView: View {
                             .foregroundColor(.secondary)
                     }
 
+                    // Search field
+                    TextField("Search folders...", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("\(filteredFolders.count) of \(allFolders.count) folders")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
                     Divider()
 
-                    // Folder tree
+                    // Folder list (flat, fast, searchable)
                     ScrollView {
                         if isLoading {
                             VStack(spacing: 16) {
                                 ProgressView()
-                                Text("Loading folder hierarchy...")
+                                Text("Loading folders...")
                                     .font(.caption)
-                                    .foregroundColor(.secondary)
-                                Text("Check console for progress")
-                                    .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .padding()
-                        } else if folderHierarchy.isEmpty {
+                        } else if allFolders.isEmpty {
                             VStack(spacing: 16) {
                                 Image(systemName: "folder.badge.questionmark")
                                     .font(.system(size: 48))
@@ -325,26 +338,25 @@ struct MainView: View {
                                 Text("No Folders Found")
                                     .font(.title3)
                                     .bold()
-                                Text("Index some folders first from the Folders tab, then come back here to filter.")
+                                Text("Index some folders first from the Folders tab")
                                     .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .multilineTextAlignment(.center)
-                                Text("Console output:")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                Text("Open Xcode Console (⌘⇧C) to see debug info")
-                                    .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .padding()
                         } else {
                             LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(folderHierarchy) { node in
-                                    FolderTreeRow(
-                                        node: node,
-                                        selectedPaths: $selectedPaths,
-                                        level: 0
+                                ForEach(filteredFolders, id: \.self) { folder in
+                                    FolderListRow(
+                                        folder: folder,
+                                        isSelected: selectedPaths.contains(folder),
+                                        onToggle: {
+                                            if selectedPaths.contains(folder) {
+                                                selectedPaths.remove(folder)
+                                            } else {
+                                                selectedPaths.insert(folder)
+                                            }
+                                        }
                                     )
                                 }
                             }
@@ -374,17 +386,47 @@ struct MainView: View {
             }
 
             func loadHierarchy() {
-                print("🔄 FolderSelectionView: Starting to load hierarchy...")
+                print("🔄 FolderSelectionView: Starting to load folders...")
                 isLoading = true
 
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let hierarchy = indexer.discoverFolderHierarchy()
+                    let folders = indexer.getAllFolders()
                     DispatchQueue.main.async {
-                        print("📊 FolderSelectionView: Loaded \(hierarchy.count) root nodes")
-                        self.folderHierarchy = hierarchy
+                        print("📊 FolderSelectionView: Loaded \(folders.count) folders")
+                        self.allFolders = folders.sorted()
                         self.isLoading = false
                     }
                 }
+            }
+        }
+
+        struct FolderListRow: View {
+            let folder: String
+            let isSelected: Bool
+            let onToggle: () -> Void
+
+            var body: some View {
+                Button(action: onToggle) {
+                    HStack(spacing: 8) {
+                        Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                            .foregroundColor(isSelected ? .accentColor : .secondary)
+
+                        Image(systemName: "folder")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Text(folder)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8)
+                    .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+                    .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
             }
         }
 

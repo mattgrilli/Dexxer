@@ -492,7 +492,35 @@ class FileIndexer: ObservableObject {
 
     // MARK: - Folder Discovery
 
-    /// Returns a hierarchical structure of all indexed folders and their subfolders
+    /// Returns a flat list of all unique folder paths from indexed files (fast, no hierarchy building)
+    func getAllFolders() -> [String] {
+        var folders = Set<String>()
+
+        print("🔍 Extracting folder paths from indexed files...")
+
+        dbQueue.sync {
+            var statement: OpaquePointer?
+            let sql = """
+            SELECT DISTINCT
+                substr(path, 1, length(path) - length(name) - 1) as folder_path
+            FROM files
+            WHERE folder_path != ''
+            """
+
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let folderPath = String(cString: sqlite3_column_text(statement, 0))
+                    folders.insert(folderPath)
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        print("  ✅ Found \(folders.count) unique folders")
+        return Array(folders)
+    }
+
+    /// Returns a hierarchical structure of all indexed folders and their subfolders (DEPRECATED - too slow for 1800+ folders)
     func discoverFolderHierarchy() -> [FolderNode] {
         var folderSet = Set<String>()
 
