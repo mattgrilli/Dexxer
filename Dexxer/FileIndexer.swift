@@ -665,6 +665,38 @@ class FileIndexer: ObservableObject {
         print("  ✅ Hierarchy ready to display")
         return sorted
     }
+
+    /// Get all descendant folder paths under a given parent path
+    func getAllDescendantFolders(of parentPath: String) -> [String] {
+        var descendants = Set<String>()
+
+        dbQueue.sync {
+            var statement: OpaquePointer?
+            let sql = "SELECT DISTINCT path FROM files WHERE path LIKE ? || '/%'"
+
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (parentPath as NSString).utf8String, -1, nil)
+
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let filePath = String(cString: sqlite3_column_text(statement, 0))
+
+                    // Extract all folder components from this file path
+                    if filePath.hasPrefix(parentPath + "/") {
+                        var currentPath = filePath
+                        while currentPath != parentPath {
+                            currentPath = URL(fileURLWithPath: currentPath).deletingLastPathComponent().path
+                            if currentPath != parentPath && currentPath.hasPrefix(parentPath + "/") {
+                                descendants.insert(currentPath)
+                            }
+                        }
+                    }
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        return Array(descendants).sorted()
+    }
 }
 
 /// Represents a folder in the hierarchy

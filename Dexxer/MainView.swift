@@ -496,9 +496,15 @@ struct MainView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     Button(action: {
                         if isSelected {
+                            // Remove this folder and all descendants
                             selectedPaths.remove(node.path)
+                            let descendants = indexer.getAllDescendantFolders(of: node.path)
+                            descendants.forEach { selectedPaths.remove($0) }
                         } else {
+                            // Add this folder and all descendants
                             selectedPaths.insert(node.path)
+                            let descendants = indexer.getAllDescendantFolders(of: node.path)
+                            descendants.forEach { selectedPaths.insert($0) }
                         }
                     }) {
                         HStack(spacing: 6) {
