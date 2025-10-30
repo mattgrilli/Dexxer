@@ -463,38 +463,56 @@ class FileIndexer: ObservableObject {
     /// Returns a hierarchical structure of all indexed folders and their immediate subfolders
     func discoverFolderHierarchy() -> [FolderNode] {
         var folderSet = Set<String>()
+        var fileCount = 0
 
         print("🔍 Discovering folder hierarchy...")
 
         dbQueue.sync {
             var statement: OpaquePointer?
-            let sql = "SELECT DISTINCT path FROM files ORDER BY path"
+            let sql = "SELECT DISTINCT path FROM files LIMIT 10000"  // Limit to prevent hanging on huge DBs
 
+            print("  Preparing SQL query...")
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                print("  Query prepared, fetching paths...")
+
                 while sqlite3_step(statement) == SQLITE_ROW {
+                    fileCount += 1
                     let fullPath = String(cString: sqlite3_column_text(statement, 0))
                     let url = URL(fileURLWithPath: fullPath)
 
                     // Add all parent directories up to (but not including) the root
                     var currentURL = url.deletingLastPathComponent()
-                    while currentURL.path != "/" {
+                    while currentURL.path != "/" && currentURL.path.count > 1 {
                         folderSet.insert(currentURL.path)
                         currentURL = currentURL.deletingLastPathComponent()
                     }
+
+                    // Progress update every 1000 files
+                    if fileCount % 1000 == 0 {
+                        print("  ... processed \(fileCount) file paths, found \(folderSet.count) folders")
+                    }
                 }
+                print("  Query complete, processed \(fileCount) paths")
+            } else {
+                print("  ❌ SQL query failed")
             }
             sqlite3_finalize(statement)
         }
 
-        print("📂 Found \(folderSet.count) unique folders from indexed files")
+        print("📂 Found \(folderSet.count) unique folders from \(fileCount) indexed files")
         print("📁 Indexed root folders: \(indexedFolders)")
 
         // Build hierarchy from flat list
-        return buildHierarchy(from: Array(folderSet))
+        print("  Building hierarchy tree...")
+        let result = buildHierarchy(from: Array(folderSet))
+        print("  Hierarchy build complete!")
+        return result
     }
 
     /// Builds a hierarchical tree from a flat list of paths
     private func buildHierarchy(from paths: [String]) -> [FolderNode] {
+        print("  Sorting \(paths.count) paths by depth...")
+
         var nodeMap: [String: FolderNode] = [:]
         var rootNodes: [FolderNode] = []
 
@@ -508,7 +526,9 @@ class FileIndexer: ObservableObject {
             return depth1 < depth2
         }
 
-        for path in sortedPaths {
+        print("  Processing \(sortedPaths.count) sorted paths...")
+
+        for (index, path) in sortedPaths.enumerated() {
             let url = URL(fileURLWithPath: path)
             let parentPath = url.deletingLastPathComponent().path
 
@@ -522,9 +542,9 @@ class FileIndexer: ObservableObject {
             if indexedFolders.contains(path) {
                 if !rootNodes.contains(where: { $0.path == path }) {
                     rootNodes.append(node)
-                    print("  ✓ Added root: \(path)")
+                    print("    ✓ Added root: \(path)")
                 }
-            } else if parentPath != "/" {
+            } else if parentPath != "/" && parentPath.count > 1 {
                 // Create parent if it doesn't exist
                 if nodeMap[parentPath] == nil {
                     nodeMap[parentPath] = FolderNode(path: parentPath, name: URL(fileURLWithPath: parentPath).lastPathComponent)
@@ -536,10 +556,17 @@ class FileIndexer: ObservableObject {
                     parentNode.children.append(node)
                 }
             }
+
+            // Progress update every 500 nodes
+            if (index + 1) % 500 == 0 {
+                print("    ... processed \(index + 1)/\(sortedPaths.count) nodes")
+            }
         }
 
-        print("🌲 Built hierarchy with \(rootNodes.count) root nodes")
-        return rootNodes.sorted { $0.path < $1.path }
+        print("  🌲 Built hierarchy with \(rootNodes.count) root nodes")
+        let sorted = rootNodes.sorted { $0.path < $1.path }
+        print("  ✅ Hierarchy ready to display")
+        return sorted
     }
 }
 
