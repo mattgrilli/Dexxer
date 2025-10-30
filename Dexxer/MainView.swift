@@ -1035,7 +1035,7 @@ struct MainView: View {
                 Divider()
                 
                 // Quick Look preview
-                QuickLookPreview(url: item.fileURL)
+                QuickLookPreview(url: item.fileURL, folderRoot: item.folderRoot)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 
                 Divider()
@@ -1068,15 +1068,57 @@ struct MainView: View {
     // Quick Look wrapper
     struct QuickLookPreview: NSViewRepresentable {
         let url: URL
-        
+        let folderRoot: String
+
         func makeNSView(context: Context) -> QLPreviewView {
             let preview = QLPreviewView()
             preview.autostarts = true
             return preview
         }
-        
+
         func updateNSView(_ nsView: QLPreviewView, context: Context) {
+            // First, try to access the root folder's security-scoped bookmark
+            if let rootURL = BookmarkStore.resolve(path: folderRoot) {
+                let didStartRoot = rootURL.startAccessingSecurityScopedResource()
+                if didStartRoot {
+                    context.coordinator.rootURL = rootURL
+                    context.coordinator.didStartRootSecurityScope = true
+                }
+            }
+
+            // Then try accessing the file itself
+            let didStartFile = url.startAccessingSecurityScopedResource()
+            if didStartFile {
+                context.coordinator.didStartFileSecurityScope = true
+            }
+
+            // Set the preview item
             nsView.previewItem = url as QLPreviewItem
+            nsView.refreshPreviewItem()
+        }
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator(url: url)
+        }
+
+        class Coordinator: NSObject {
+            let url: URL
+            var rootURL: URL?
+            var didStartFileSecurityScope = false
+            var didStartRootSecurityScope = false
+
+            init(url: URL) {
+                self.url = url
+            }
+
+            deinit {
+                if didStartFileSecurityScope {
+                    url.stopAccessingSecurityScopedResource()
+                }
+                if didStartRootSecurityScope, let rootURL = rootURL {
+                    rootURL.stopAccessingSecurityScopedResource()
+                }
+            }
         }
     }
     
