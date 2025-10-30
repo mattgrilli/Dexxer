@@ -1332,12 +1332,22 @@ struct MainView: View {
 
                             // Status chip
                             if isNetwork {
-                                Text(reachable ? "Network • Connected" : "Network • Disconnected")
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(reachable ? Color.green.opacity(0.18) : Color.red.opacity(0.18))
-                                    .foregroundColor(reachable ? .green : .red)
-                                    .cornerRadius(6)
+                                HStack(spacing: 4) {
+                                    Text(reachable ? "Network • Connected" : "Network • Disconnected")
+                                        .font(.system(size: 10, weight: .semibold))
+
+                                    // Refresh button
+                                    Button(action: refreshStatus) {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Refresh: Check connection status again")
+                                }
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(reachable ? Color.green.opacity(0.18) : Color.red.opacity(0.18))
+                                .foregroundColor(reachable ? .green : .red)
+                                .cornerRadius(6)
                             } else {
                                 Text("Local")
                                     .font(.system(size: 10, weight: .semibold))
@@ -1363,8 +1373,8 @@ struct MainView: View {
 
                     Spacer()
 
-                    // Actions
-                    HStack(spacing: 12) {
+                    // Actions (Hover to see tooltips)
+                    HStack(spacing: 14) {
                         Button(action: reindexFolder) {
                             Image(systemName: "arrow.clockwise")
                                 .foregroundColor(indexer.isIndexing || (isNetwork && !reachable) ? .secondary : .primary)
@@ -1386,7 +1396,7 @@ struct MainView: View {
                                     .foregroundColor(.blue)
                             }
                             .buttonStyle(.plain)
-                            .help("Connect: Connect to this network share (SMB/AFP/NFS)")
+                            .help("Connect: Open macOS Connect to Server dialog")
                         }
 
                         Button(action: removeFolder) {
@@ -1396,8 +1406,8 @@ struct MainView: View {
                         .buttonStyle(.plain)
                         .help("Remove: Remove this folder from index (does not delete files, asks for confirmation)")
                     }
-                    .opacity(isHovered ? 1 : 0.5)
-                    .font(.system(size: 15))
+                    .opacity(isHovered ? 1 : 0.6)
+                    .font(.system(size: 16))
                 }
                 .padding()
                 .background(isHovered ? Color(nsColor: .controlAccentColor).opacity(0.05) : Color.clear)
@@ -1461,16 +1471,61 @@ struct MainView: View {
             }
 
             private func connectToServer() {
-                // Prompt for SMB/NFS URL and open it (e.g., smb://server/Share)
-                if let text = promptForText(title: "Connect to Server",
-                                            message: "Enter a server URL (e.g., smb://fileserver/TeamShare)",
-                                            placeholder: "smb://server/Share"),
-                   let url = URL(string: text), ["smb", "afp", "nfs"].contains(url.scheme?.lowercased() ?? "") {
-                    NSWorkspace.shared.open(url)
-                    // Give the system a moment to mount, then refresh
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { refreshStatus() }
+                // Try to extract server info from the path
+                // Path format: /Volumes/ShareName or /Volumes/ShareName/Subfolder
+                let pathComponents = folder.components(separatedBy: "/")
+
+                if pathComponents.count >= 3 && pathComponents[1] == "Volumes" {
+                    let shareName = pathComponents[2]
+
+                    // Show dialog with detected share
+                    let alert = NSAlert()
+                    alert.messageText = "Connect to Network Share"
+                    alert.informativeText = """
+                    Detected share: \(shareName)
+
+                    This will open macOS's "Connect to Server" dialog.
+
+                    Tip: Your server URL typically looks like:
+                    smb://server.local/\(shareName)
+                    """
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "Open Connect to Server")
+                    alert.addButton(withTitle: "Cancel")
+
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        // Open Finder's Connect to Server dialog (Cmd+K)
+                        openConnectToServerDialog()
+
+                        // Give user time to connect, then refresh
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+                            refreshStatus()
+                        }
+                    }
                 } else {
-                    infoAlert("Invalid URL", "Use a valid server URL like smb://fileserver/TeamShare")
+                    // Fallback: just open the Connect to Server dialog
+                    openConnectToServerDialog()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+                        refreshStatus()
+                    }
+                }
+            }
+
+            private func openConnectToServerDialog() {
+                // Use AppleScript to open Finder's Connect to Server dialog
+                let script = """
+                tell application "Finder"
+                    activate
+                    open location "smb://"
+                end tell
+                """
+
+                if let appleScript = NSAppleScript(source: script) {
+                    var error: NSDictionary?
+                    appleScript.executeAndReturnError(&error)
+                    if let error = error {
+                        print("⚠️ Failed to open Connect to Server: \(error)")
+                    }
                 }
             }
 
