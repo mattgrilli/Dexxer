@@ -211,6 +211,7 @@ struct MainView: View {
             @State private var folderHierarchy: [FolderNode] = []
             @State private var saveScopeName: String = ""
             @State private var showSaveScope = false
+            @State private var isLoading = true
 
             var body: some View {
                 VStack(alignment: .leading, spacing: 12) {
@@ -304,13 +305,48 @@ struct MainView: View {
 
                     // Folder tree
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(folderHierarchy) { node in
-                                FolderTreeRow(
-                                    node: node,
-                                    selectedPaths: $selectedPaths,
-                                    level: 0
-                                )
+                        if isLoading {
+                            VStack(spacing: 16) {
+                                ProgressView()
+                                Text("Loading folder hierarchy...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("Check console for progress")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .padding()
+                        } else if folderHierarchy.isEmpty {
+                            VStack(spacing: 16) {
+                                Image(systemName: "folder.badge.questionmark")
+                                    .font(.system(size: 48))
+                                    .foregroundColor(.secondary)
+                                Text("No Folders Found")
+                                    .font(.title3)
+                                    .bold()
+                                Text("Index some folders first from the Folders tab, then come back here to filter.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .multilineTextAlignment(.center)
+                                Text("Console output:")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Text("Open Xcode Console (⌘⇧C) to see debug info")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .padding()
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(folderHierarchy) { node in
+                                    FolderTreeRow(
+                                        node: node,
+                                        selectedPaths: $selectedPaths,
+                                        level: 0
+                                    )
+                                }
                             }
                         }
                     }
@@ -338,10 +374,15 @@ struct MainView: View {
             }
 
             func loadHierarchy() {
+                print("🔄 FolderSelectionView: Starting to load hierarchy...")
+                isLoading = true
+
                 DispatchQueue.global(qos: .userInitiated).async {
                     let hierarchy = indexer.discoverFolderHierarchy()
                     DispatchQueue.main.async {
+                        print("📊 FolderSelectionView: Loaded \(hierarchy.count) root nodes")
                         self.folderHierarchy = hierarchy
+                        self.isLoading = false
                     }
                 }
             }
