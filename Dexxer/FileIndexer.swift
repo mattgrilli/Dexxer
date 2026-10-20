@@ -7,42 +7,194 @@
 
 import Foundation
 import SQLite3
+import os
+import Vision
+import AppKit
+import ImageIO
+import PDFKit
 
-class FileIndexer: ObservableObject {
-    var db: OpaquePointer?
+/// Tells SQLite to copy bound strings, so Swift temporaries can't dangle.
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+struct IndexStats: Equatable {
+    var count = 0
+    var totalSize: Int64 = 0
+}
+
+enum AddFolderResult {
+    case added(String)
+    case alreadyIndexed
+    case coveredBy(String)
+}
+
+final class FileIndexer: ObservableObject {
+    private var db: OpaquePointer?
     let dbPath: String
     private let configPath: String
-    let dbQueue = DispatchQueue(label: "com.mattgrilli.dexxer.db", qos: .userInitiated)
-    
-    @Published var indexedFolders: [String] = []
-    @Published var isIndexing = false
-    @Published var indexProgress: Int = 0
-    
-    init() {
-        // Use Dexxer-specific database and config
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        self.dbPath = "\(homeDir)/.dexxer.db"
-        self.configPath = "\(homeDir)/.dexxer_config.json"
-        
+    /// All database access goes through this serial queue. Never call `dbQueue.sync` from code already on it.
+    private let dbQueue = DispatchQueue(label: "com.mattgrilli.dexxer.db", qos: .userInitiated)
+    private let logger = Logger(subsystem: "com.mattgrilli.dexxer", category: "indexing")
+
+    static let isoFormatter = ISO8601DateFormatter()
+
+    @Published private(set) var indexedFolders: [String] = []
+    @Published private(set) var isIndexing = false
+    @Published private(set) var isCancellingIndex = false
+    /// Files scanned so far in the current run
+    @Published private(set) var indexProgress = 0
+    @Published private(set) var currentlyIndexing: String?
+    /// File whose text is being extracted, when that is what the run is waiting on
+    @Published private(set) var currentFileName: String?
+    @Published private(set) var stats = IndexStats()
+    @Published private(set) var folderFileCounts: [String: Int] = [:]
+    /// Last known reachability per indexed folder. Checked off the main thread because a hung
+    /// network mount can block file system calls for a long time.
+    @Published private(set) var reachability: [String: Bool] = [:]
+    /// Folders the last run skipped because they were offline
+    @Published private(set) var lastSkippedFolders: [String] = []
+    /// When each folder last finished a complete scan (stopped or interrupted runs don't count)
+    @Published private(set) var lastIndexed: [String: Date] = [:]
+
+    @Published var excludePatternsEnabled: Bool {
+        didSet { UserDefaults.standard.set(excludePatternsEnabled, forKey: Keys.excludePatterns) }
+    }
+    @Published var ocrEnabled: Bool {
+        didSet { UserDefaults.standard.set(ocrEnabled, forKey: Keys.ocr) }
+    }
+    @Published var autoReindexEnabled: Bool {
+        didSet { UserDefaults.standard.set(autoReindexEnabled, forKey: Keys.autoReindex) }
+    }
+
+    let excludedFolders = [".git", ".svn", "node_modules", ".Trash", "__pycache__", ".cache", "venv", "build", "dist", ".idea", ".vscode"]
+    let excludedFiles = [".DS_Store", "Thumbs.db", "desktop.ini", "._*"]
+
+    private let cancelRequested = OSAllocatedUnfairLock(initialState: false)
+    private var isCancelled: Bool { cancelRequested.withLock { $0 } }
+    /// Folders requested while a run was in progress; indexed when it finishes
+    private var queuedFolders: [String] = []
+    private var reachabilityCheckInFlight = false
+
+    private enum Keys {
+        static let excludePatterns = "DexxerExcludePatternsEnabled"
+        static let ocr = "DexxerOCREnabled"
+        static let autoReindex = "DexxerAutoReindex"
+    }
+
+    /// Bump when text extraction improves so existing rows get re-extracted.
+    /// v1: full PDF text layer plus OCR of scanned pages (v0 only OCR'd page 1).
+    static let textExtractionVersion = 1
+    private static let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "tiff", "tif", "bmp", "gif"]
+    private static let maxTextLength = 200_000
+    private static let maxOCRPagesPerPDF = 20
+    private static let batchSize = 500
+
+    init(directory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        dbPath = directory.appendingPathComponent(".dexxer.db").path
+        configPath = directory.appendingPathComponent(".dexxer_config.json").path
+
+        let defaults = UserDefaults.standard
+        excludePatternsEnabled = defaults.object(forKey: Keys.excludePatterns) as? Bool ?? true
+        ocrEnabled = defaults.object(forKey: Keys.ocr) as? Bool ?? false
+        autoReindexEnabled = defaults.object(forKey: Keys.autoReindex) as? Bool ?? true
+        // Leftovers from the old crash-recovery scheme, which deleted data on relaunch
+        defaults.removeObject(forKey: "DexxerIndexingInProgress")
+        defaults.removeObject(forKey: "DexxerLastIndexedFolder")
+
         openDatabase()
         loadConfig()
+
+        // The OCR setting used to reset on every launch. If the index already has
+        // extracted text, keep extracting so re-indexing doesn't silently stop.
+        if defaults.object(forKey: Keys.ocr) == nil, hasExtractedText() {
+            ocrEnabled = true
+            defaults.set(true, forKey: Keys.ocr)
+        }
+
+        verifyFTSIndex()
+        refreshStats()
+        refreshReachability()
     }
-    
+
     deinit {
         sqlite3_close(db)
     }
-    
-    
-    
+
+    // MARK: - SQLite helpers
+
+    private enum SQLValue {
+        case text(String)
+        case int(Int64)
+        case null
+    }
+
+    private var lastError: String { String(cString: sqlite3_errmsg(db)) }
+
+    @discardableResult
+    private func exec(_ sql: String) -> Bool {
+        var error: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(db, sql, nil, nil, &error) == SQLITE_OK else {
+            let message = error.map { String(cString: $0) } ?? "unknown error"
+            sqlite3_free(error)
+            logger.error("SQL failed: \(message, privacy: .public)")
+            return false
+        }
+        return true
+    }
+
+    private func bind(_ params: [SQLValue], to statement: OpaquePointer) {
+        for (offset, param) in params.enumerated() {
+            let index = Int32(offset + 1)
+            switch param {
+            case .text(let value): sqlite3_bind_text(statement, index, value, -1, SQLITE_TRANSIENT)
+            case .int(let value): sqlite3_bind_int64(statement, index, value)
+            case .null: sqlite3_bind_null(statement, index)
+            }
+        }
+    }
+
+    /// Runs a statement and calls `row` for each result row. Call on `dbQueue` (or during init).
+    @discardableResult
+    private func query(_ sql: String, _ params: [SQLValue] = [], row: (OpaquePointer) -> Void = { _ in }) -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            logger.error("Prepare failed: \(self.lastError, privacy: .public)")
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+        bind(params, to: statement)
+
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW: row(statement)
+            case SQLITE_DONE: return true
+            default:
+                logger.error("Step failed: \(self.lastError, privacy: .public)")
+                return false
+            }
+        }
+    }
+
+    private static func columnText(_ statement: OpaquePointer, _ column: Int32) -> String {
+        sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""
+    }
+
+    private static func likeEscaped(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+    }
+
+    // MARK: - Schema
+
     private func openDatabase() {
-        if sqlite3_open(dbPath, &db) != SQLITE_OK {
-            print("Error opening database")
+        guard sqlite3_open(dbPath, &db) == SQLITE_OK else {
+            logger.error("Could not open database at \(self.dbPath, privacy: .public)")
             return
         }
-        
-        // Database already exists from Python version, so we don't need to create tables
-        // But we'll check if it exists and create if needed for fresh installs
-        let createTableSQL = """
+
+        exec("PRAGMA journal_mode=WAL")
+        exec("PRAGMA synchronous=NORMAL")
+        exec("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT UNIQUE,
@@ -51,484 +203,796 @@ class FileIndexer: ObservableObject {
             size INTEGER,
             modified_time TEXT,
             indexed_time TEXT,
-            folder_root TEXT
-        );
-        """
-        
-        if sqlite3_exec(db, createTableSQL, nil, nil, nil) != SQLITE_OK {
-            print("Error creating table")
+            folder_root TEXT,
+            ocr_text TEXT,
+            text_version INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+
+        // Migrations for databases created by earlier versions
+        if !columnExists("ocr_text") { exec("ALTER TABLE files ADD COLUMN ocr_text TEXT") }
+        if !columnExists("text_version") { exec("ALTER TABLE files ADD COLUMN text_version INTEGER NOT NULL DEFAULT 0") }
+
+        exec("CREATE INDEX IF NOT EXISTS idx_name ON files(name)")
+        exec("CREATE INDEX IF NOT EXISTS idx_extension ON files(extension)")
+        exec("CREATE INDEX IF NOT EXISTS idx_folder_root ON files(folder_root)")
+        exec("CREATE INDEX IF NOT EXISTS idx_modified ON files(modified_time)")
+
+        createFTSTable()
+
+        var hasFolderState = false
+        query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'folder_state')") {
+            hasFolderState = sqlite3_column_int($0, 0) == 1
         }
-        
-        // Create indexes if they don't exist
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_name ON files(name)", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_extension ON files(extension)", nil, nil, nil)
+        exec("""
+        CREATE TABLE IF NOT EXISTS folder_state (
+            root TEXT PRIMARY KEY,
+            last_indexed TEXT NOT NULL
+        )
+        """)
+        if !hasFolderState {
+            // Upgrading: approximate from the newest row written for each folder
+            exec("INSERT INTO folder_state SELECT folder_root, MAX(indexed_time) FROM files WHERE folder_root IS NOT NULL GROUP BY folder_root")
+        }
+        query("SELECT root, last_indexed FROM folder_state") {
+            lastIndexed[Self.columnText($0, 0)] = Self.isoFormatter.date(from: Self.columnText($0, 1))
+        }
     }
-    
+
+    private func columnExists(_ column: String) -> Bool {
+        var exists = false
+        query("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = ?", [.text(column)]) {
+            exists = sqlite3_column_int($0, 0) > 0
+        }
+        return exists
+    }
+
+    private func createFTSTable() {
+        // Early versions created the index without ocr_text, and CREATE ... IF NOT EXISTS never
+        // upgrades it, so extracted text was stored but never searchable. Recreate it here;
+        // verifyFTSIndex then sees it's empty and rebuilds it from the files table.
+        var hasTextColumn = true
+        query("SELECT COUNT(*) FROM pragma_table_info('files_fts') WHERE name = 'ocr_text'") {
+            hasTextColumn = sqlite3_column_int($0, 0) > 0
+        }
+        var ftsExists = false
+        query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'files_fts')") {
+            ftsExists = sqlite3_column_int($0, 0) == 1
+        }
+        if ftsExists && !hasTextColumn {
+            logger.warning("Search index is missing extracted text; recreating it")
+            exec("DROP TRIGGER IF EXISTS files_fts_insert")
+            exec("DROP TRIGGER IF EXISTS files_fts_delete")
+            exec("DROP TRIGGER IF EXISTS files_fts_update")
+            exec("DROP TABLE files_fts")
+        }
+
+        exec("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            name, path, ocr_text,
+            content='files', content_rowid='id'
+        )
+        """)
+
+        // Triggers keep the FTS index in sync with the files table
+        exec("""
+        CREATE TRIGGER IF NOT EXISTS files_fts_insert AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, name, path, ocr_text)
+            VALUES (new.id, new.name, new.path, new.ocr_text);
+        END
+        """)
+        exec("""
+        CREATE TRIGGER IF NOT EXISTS files_fts_delete AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, path, ocr_text)
+            VALUES ('delete', old.id, old.name, old.path, old.ocr_text);
+        END
+        """)
+        exec("""
+        CREATE TRIGGER IF NOT EXISTS files_fts_update AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, path, ocr_text)
+            VALUES ('delete', old.id, old.name, old.path, old.ocr_text);
+            INSERT INTO files_fts(rowid, name, path, ocr_text)
+            VALUES (new.id, new.name, new.path, new.ocr_text);
+        END
+        """)
+    }
+
+    private func hasExtractedText() -> Bool {
+        var found = false
+        query("SELECT EXISTS(SELECT 1 FROM files WHERE ocr_text IS NOT NULL AND ocr_text != '')") {
+            found = sqlite3_column_int($0, 0) == 1
+        }
+        return found
+    }
+
+    // MARK: - FTS5 maintenance
+
+    /// Rebuilds the FTS index if it has drifted from the files table.
+    /// `files_fts_docsize` holds one row per indexed document; counting `files_fts`
+    /// itself would just count the content table and never show a mismatch.
+    private func verifyFTSIndex() {
+        dbQueue.async {
+            var files = 0
+            var indexed = 0
+            self.query("SELECT COUNT(*) FROM files") { files = Int(sqlite3_column_int64($0, 0)) }
+            self.query("SELECT COUNT(*) FROM files_fts_docsize") { indexed = Int(sqlite3_column_int64($0, 0)) }
+
+            if files != indexed {
+                self.logger.warning("FTS index out of sync (\(files) files, \(indexed) indexed); rebuilding")
+                self.exec("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+            }
+        }
+    }
+
+    /// Rebuilds the full-text index from the files table, then compacts it.
+    func rebuildSearchIndex(completion: @escaping () -> Void) {
+        dbQueue.async {
+            self.exec("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+            self.exec("INSERT INTO files_fts(files_fts) VALUES('optimize')")
+            DispatchQueue.main.async(execute: completion)
+        }
+    }
+
+    // MARK: - Folders
+
     private func loadConfig() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
-              let folders = try? JSONDecoder().decode([String].self, from: data) else {
-            indexedFolders = []
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let folders = try? JSONDecoder().decode([String].self, from: data) else { return }
+        var seen = Set<String>()
+        indexedFolders = folders.filter { seen.insert($0).inserted }
+    }
+
+    private func saveConfig() {
+        do {
+            try JSONEncoder().encode(indexedFolders).write(to: URL(fileURLWithPath: configPath), options: .atomic)
+        } catch {
+            logger.error("Failed to save folder list: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Adds a folder the user picked or dropped, remembering sandbox access to it.
+    func addFolder(_ url: URL) -> AddFolderResult {
+        let path = url.standardizedFileURL.path
+        if indexedFolders.contains(path) {
+            BookmarkStore.save(path: path, url: url)  // refresh access anyway
+            return .alreadyIndexed
+        }
+        if let root = indexedFolders.first(where: { path.hasPrefix($0 + "/") }) {
+            return .coveredBy(root)
+        }
+
+        BookmarkStore.save(path: path, url: url)
+        indexedFolders.append(path)
+        saveConfig()
+        refreshReachability()
+        return .added(path)
+    }
+
+    func removeFolder(_ path: String) {
+        indexedFolders.removeAll { $0 == path }
+        queuedFolders.removeAll { $0 == path }
+        saveConfig()
+        BookmarkStore.remove(path: path)
+        reachability[path] = nil
+        lastIndexed[path] = nil
+
+        dbQueue.async {
+            self.query("DELETE FROM files WHERE folder_root = ?", [.text(path)])
+            self.query("DELETE FROM folder_state WHERE root = ?", [.text(path)])
+            self.refreshStatsOnQueue()
+        }
+    }
+
+    /// Re-records sandbox access after the user re-selects a folder that lost it.
+    func grantAccess(to path: String, using url: URL) {
+        BookmarkStore.save(path: path, url: url)
+        refreshReachability()
+    }
+
+    // MARK: - Status
+
+    func refreshStats() {
+        dbQueue.async { self.refreshStatsOnQueue() }
+    }
+
+    private func refreshStatsOnQueue() {
+        var stats = IndexStats()
+        var counts: [String: Int] = [:]
+        query("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files") {
+            stats = IndexStats(count: Int(sqlite3_column_int64($0, 0)), totalSize: sqlite3_column_int64($0, 1))
+        }
+        query("SELECT folder_root, COUNT(*) FROM files GROUP BY folder_root") {
+            counts[Self.columnText($0, 0)] = Int(sqlite3_column_int64($0, 1))
+        }
+        DispatchQueue.main.async {
+            self.stats = stats
+            self.folderFileCounts = counts
+        }
+    }
+
+    func refreshReachability() {
+        guard !reachabilityCheckInFlight else { return }
+        reachabilityCheckInFlight = true
+        let folders = indexedFolders
+
+        DispatchQueue.global(qos: .utility).async {
+            let result = Dictionary(folders.map { ($0, self.isReachableFolder($0)) }, uniquingKeysWith: { first, _ in first })
+            DispatchQueue.main.async {
+                self.reachability = result
+                self.reachabilityCheckInFlight = false
+            }
+        }
+    }
+
+    func isReachable(_ folder: String) -> Bool {
+        reachability[folder] ?? true
+    }
+
+    // MARK: - Indexing
+
+    private struct IndexOptions {
+        let extractText: Bool
+        let excludedFolders: Set<String>
+        let excludedFiles: [String]
+    }
+
+    private struct ExistingRow {
+        let size: Int64
+        let modified: String
+        let hasText: Bool
+        let textVersion: Int
+    }
+
+    private struct FileRecord {
+        let path: String
+        let name: String
+        let ext: String
+        let size: Int64
+        let modified: String
+        let text: String?
+        let textVersion: Int
+    }
+
+    /// Re-indexes folders that are online and haven't finished a scan within `maxAge`.
+    /// Cheap when little has changed, since only new and changed files are read.
+    func indexStaleFolders(olderThan maxAge: TimeInterval) {
+        guard autoReindexEnabled, !isIndexing else { return }
+        let stale = indexedFolders.filter { folder in
+            guard isReachable(folder) else { return false }
+            guard let last = lastIndexed[folder] else { return true }
+            return Date().timeIntervalSince(last) > maxAge
+        }
+        if !stale.isEmpty {
+            logger.info("Automatically re-indexing \(stale.count) folders")
+            indexFolders(stale)
+        }
+    }
+
+    func cancelIndexing() {
+        guard isIndexing else { return }
+        queuedFolders.removeAll()
+        cancelRequested.withLock { $0 = true }
+        isCancellingIndex = true
+    }
+
+    /// Indexes the given folders (all folders when nil). If a run is already going, the
+    /// folders are queued and indexed when it finishes. Call from the main thread.
+    func indexFolders(_ folders: [String]? = nil, completion: ((Int) -> Void)? = nil) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let targets = folders ?? indexedFolders
+        guard !targets.isEmpty else { return }
+
+        if isIndexing {
+            queuedFolders += targets.filter { !queuedFolders.contains($0) }
             return
         }
-        indexedFolders = folders
-    }
-    
-    func saveConfig() {
-        guard let data = try? JSONEncoder().encode(indexedFolders) else { return }
-        try? data.write(to: URL(fileURLWithPath: configPath))
-    }
-    
-    func addFolder(_ folderPath: String) {
-        let resolvedPath = URL(fileURLWithPath: folderPath).standardizedFileURL.path
-        if !indexedFolders.contains(resolvedPath) {
-            indexedFolders.append(resolvedPath)
-            saveConfig()
-        }
-    }
-    
-    func removeFolder(_ folderPath: String) {
-        indexedFolders.removeAll { $0 == folderPath }
-        saveConfig()
-        
-        // Remove files from this folder from database - use serial queue
-        dbQueue.sync {
-            let deleteSQL = "DELETE FROM files WHERE folder_root = ?"
-            var statement: OpaquePointer?
-            
-            if sqlite3_prepare_v2(db, deleteSQL, -1, &statement, nil) == SQLITE_OK {
-                sqlite3_bind_text(statement, 1, (folderPath as NSString).utf8String, -1, nil)
-                sqlite3_step(statement)
-            }
-            sqlite3_finalize(statement)
-        }
-    }
-    
-    func indexFolders(_ folders: [String]? = nil, progressCallback: ((Int) -> Void)? = nil) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            
-            print("🔍 Starting indexing...")
-            
-            DispatchQueue.main.async {
-                self.isIndexing = true
-                self.indexProgress = 0
-            }
-            
-            let foldersToIndex = folders ?? self.indexedFolders
-            print("📁 Folders to index: \(foldersToIndex)")
-            
-            // Clear old entries for these folders - use serial queue for thread safety
-            self.dbQueue.sync {
-                for folder in foldersToIndex {
-                    let deleteSQL = "DELETE FROM files WHERE folder_root = ?"
-                    var statement: OpaquePointer?
-                    if sqlite3_prepare_v2(self.db, deleteSQL, -1, &statement, nil) == SQLITE_OK {
-                        sqlite3_bind_text(statement, 1, (folder as NSString).utf8String, -1, nil)
-                        sqlite3_step(statement)
-                    }
-                    sqlite3_finalize(statement)
-                }
-            }
-            
-            var totalFiles = 0
-            let fileManager = FileManager.default
-            
-            let insertSQL = """
-            INSERT OR REPLACE INTO files (path, name, extension, size, modified_time, indexed_time, folder_root)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """
-            
-            for folderRoot in foldersToIndex {
-                print("📂 Indexing: \(folderRoot)")
-                
-                
-                // Re-resolve a security-scoped URL if we have one
-                let urlForRoot: URL = BookmarkStore.resolve(path: folderRoot)
-                    ?? URL(fileURLWithPath: folderRoot)
 
-                var didStartScope = false
-                if urlForRoot.startAccessingSecurityScopedResource() {
-                    didStartScope = true
-                }
+        isIndexing = true
+        isCancellingIndex = false
+        indexProgress = 0
+        cancelRequested.withLock { $0 = false }
 
-                defer {
-                    if didStartScope { urlForRoot.stopAccessingSecurityScopedResource() }
-                }
+        // Snapshot settings on the main thread so the background run never reads them mid-change
+        let options = IndexOptions(
+            extractText: ocrEnabled,
+            excludedFolders: excludePatternsEnabled ? Set(excludedFolders) : [],
+            excludedFiles: excludePatternsEnabled ? excludedFiles : []
+        )
 
-                // Check if folder exists and is accessible
-                var isDirectory: ObjCBool = false
-                let exists = fileManager.fileExists(atPath: folderRoot, isDirectory: &isDirectory)
-                print("   Exists: \(exists), IsDirectory: \(isDirectory.boolValue)")
-                
-                if !exists {
-                    print("   ❌ Folder does not exist!")
+        DispatchQueue.global(qos: .utility).async {
+            var total = 0
+            var skipped: [String] = []
+
+            for root in targets {
+                if self.isCancelled { break }
+                guard self.isReachableFolder(root) else {
+                    skipped.append(root)
                     continue
                 }
-                
-                if !isDirectory.boolValue {
-                    print("   ❌ Path is not a directory!")
-                    continue
-                }
-                
-                // Check if we can read the directory
-                if !fileManager.isReadableFile(atPath: folderRoot) {
-                    print("   ❌ Folder is not readable! Permission denied.")
-                    continue
-                }
-                
-                guard let enumerator = fileManager.enumerator(
-                    at: URL(fileURLWithPath: folderRoot),
-                    includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-                    options: [.skipsHiddenFiles, .skipsPackageDescendants]
-                ) else {
-                    print("❌ Failed to create enumerator for \(folderRoot)")
-                    continue
-                }
-                
-                print("   ✅ Enumerator created, scanning files...")
-                var fileCount = 0
-                
-                for case let fileURL as URL in enumerator {
-                    fileCount += 1
-                    if fileCount % 100 == 0 {
-                        print("   ... scanned \(fileCount) items")
-                    }
-                    
-                    guard let resourceValues = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
-                          let isRegularFile = resourceValues.isRegularFile,
-                          isRegularFile else {
-                        continue
-                    }
-                    
-                    let path = fileURL.path
-                    let name = fileURL.lastPathComponent
-                    let ext = fileURL.pathExtension.lowercased()
-                    let size = Int64(resourceValues.fileSize ?? 0)
-                    let modifiedTime = resourceValues.contentModificationDate ?? Date()
-                    
-                    // Use serial queue for thread-safe database access
-                    self.dbQueue.sync {
-                        var statement: OpaquePointer?
-                        if sqlite3_prepare_v2(self.db, insertSQL, -1, &statement, nil) == SQLITE_OK {
-                            sqlite3_bind_text(statement, 1, (path as NSString).utf8String, -1, nil)
-                            sqlite3_bind_text(statement, 2, (name as NSString).utf8String, -1, nil)
-                            sqlite3_bind_text(statement, 3, (ext as NSString).utf8String, -1, nil)
-                            sqlite3_bind_int64(statement, 4, size)
-                            
-                            let isoFormatter = ISO8601DateFormatter()
-                            let modifiedTimeString = isoFormatter.string(from: modifiedTime)
-                            let indexedTimeString = isoFormatter.string(from: Date())
-                            
-                            sqlite3_bind_text(statement, 5, (modifiedTimeString as NSString).utf8String, -1, nil)
-                            sqlite3_bind_text(statement, 6, (indexedTimeString as NSString).utf8String, -1, nil)
-                            sqlite3_bind_text(statement, 7, (folderRoot as NSString).utf8String, -1, nil)
-                            
-                            if sqlite3_step(statement) == SQLITE_DONE {
-                                totalFiles += 1
-                                
-                                if totalFiles % 100 == 0 {
-                                    DispatchQueue.main.async {
-                                        self.indexProgress = totalFiles
-                                    }
-                                    print("📊 Indexed \(totalFiles) files...")
-                                }
-                            }
-                        }
-                        sqlite3_finalize(statement)
-                    }
-                }
+                DispatchQueue.main.async { self.currentlyIndexing = root }
+                total += self.indexFolder(root, options: options, progressBase: total)
+                self.dbQueue.async { self.refreshStatsOnQueue() }
             }
-            
-            print("✅ Indexing complete! Total files: \(totalFiles)")
-            
+
+            self.logger.info("Indexing finished: \(total) files scanned, \(skipped.count) folders skipped")
+
             DispatchQueue.main.async {
                 self.isIndexing = false
-                self.indexProgress = totalFiles
-                progressCallback?(totalFiles)
+                self.isCancellingIndex = false
+                self.currentlyIndexing = nil
+                self.currentFileName = nil
+                self.indexProgress = total
+                self.lastSkippedFolders = skipped
+                self.refreshReachability()
+                completion?(total)
+
+                let queued = self.queuedFolders.filter { self.indexedFolders.contains($0) }
+                self.queuedFolders.removeAll()
+                if !queued.isEmpty { self.indexFolders(queued) }
             }
         }
     }
-    
-    // MARK: - Advanced Search
 
-    struct SearchFilters {
-        var query: String = ""
-        var fileType: String? = nil               // ".pdf" or "pdf" or nil
-        var folders: [String]? = nil              // path prefixes (scopes)
-        var pathContains: String? = nil           // e.g., "Legal"
-        var modifiedAfter: Date? = nil
-        var modifiedBefore: Date? = nil
-        var minSize: Int64? = nil                 // bytes
-        var maxSize: Int64? = nil                 // bytes
-        var limit: Int = 1000
+    /// Scans one root and brings its rows up to date. Unchanged files are left alone, so their
+    /// extracted text survives, and an interrupted run never loses entries that already existed.
+    private func indexFolder(_ root: String, options: IndexOptions, progressBase: Int) -> Int {
+        let scopedURL = BookmarkStore.resolve(path: root)
+        let didStartScope = scopedURL?.startAccessingSecurityScopedResource() ?? false
+        defer { if didStartScope { scopedURL?.stopAccessingSecurityScopedResource() } }
+
+        let existing = existingRows(in: root)
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        let keySet = Set(keys)
+        var unreadable: [String] = []
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: URL(fileURLWithPath: root, isDirectory: true),
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            errorHandler: { url, _ in
+                unreadable.append(url.path)
+                return true
+            }
+        ) else {
+            logger.error("Could not enumerate \(root, privacy: .public)")
+            return 0
+        }
+
+        var seen = Set<String>()
+        var batch: [FileRecord] = []
+        var scanned = 0
+        var lastReport = Date.distantPast
+        var lastWrite = Date()
+
+        // Throttled by time rather than file count: reading PDFs over a VPN can take seconds each
+        func report(reading fileName: String? = nil) {
+            guard Date().timeIntervalSince(lastReport) >= 0.5 else { return }
+            lastReport = Date()
+            let progress = progressBase + scanned
+            DispatchQueue.main.async {
+                self.indexProgress = progress
+                self.currentFileName = fileName
+            }
+        }
+
+        for case let url as URL in enumerator {
+            if isCancelled { break }
+
+            let record: FileRecord? = autoreleasepool {
+                guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
+                if values.isDirectory == true {
+                    if options.excludedFolders.contains(url.lastPathComponent) { enumerator.skipDescendants() }
+                    return nil
+                }
+                guard values.isRegularFile == true, !isExcluded(url.lastPathComponent, options) else { return nil }
+
+                let path = url.path
+                seen.insert(path)
+                scanned += 1
+
+                let size = Int64(values.fileSize ?? 0)
+                let modified = Self.isoFormatter.string(from: values.contentModificationDate ?? Date())
+                let ext = url.pathExtension.lowercased()
+                let wantsText = options.extractText && Self.supportsTextExtraction(ext)
+
+                if let old = existing[path], old.size == size, old.modified == modified {
+                    let textIsCurrent = old.hasText && (ext != "pdf" || old.textVersion >= Self.textExtractionVersion)
+                    if !wantsText || textIsCurrent { return nil }  // unchanged
+                }
+
+                // An empty string marks "extracted, no text found" so the file isn't retried every run
+                var text: String?
+                if wantsText {
+                    report(reading: url.lastPathComponent)
+                    text = extractText(from: url, ext: ext, size: size) ?? ""
+                }
+                return FileRecord(path: path, name: url.lastPathComponent, ext: ext, size: size,
+                                  modified: modified, text: text,
+                                  textVersion: wantsText ? Self.textExtractionVersion : 0)
+            }
+
+            if let record {
+                batch.append(record)
+                // Also flush every few seconds so slow runs become searchable as they go
+                if batch.count >= Self.batchSize || Date().timeIntervalSince(lastWrite) > 5 {
+                    write(batch, root: root)
+                    batch.removeAll(keepingCapacity: true)
+                    lastWrite = Date()
+                }
+            }
+            report()
+        }
+        if !batch.isEmpty { write(batch, root: root) }
+
+        // Remove rows for deleted files, but only after a complete scan of a root that is still
+        // reachable. A dropped share or unreadable subfolder must not look like mass deletion.
+        if !isCancelled, isReachableFolder(root) {
+            let stale = existing.keys.filter { path in
+                !seen.contains(path) && !unreadable.contains { path.hasPrefix($0 + "/") }
+            }
+            deleteRows(stale)
+            recordCompletedScan(of: root)
+        }
+        return scanned
     }
 
-    func searchAdvanced(_ f: SearchFilters) -> [FileItem] {
-        var results: [FileItem] = []
-
+    private func recordCompletedScan(of root: String) {
+        let now = Date()
         dbQueue.sync {
-            var clauses: [String] = []
-            var params: [String] = []
+            _ = query("INSERT OR REPLACE INTO folder_state (root, last_indexed) VALUES (?, ?)",
+                      [.text(root), .text(Self.isoFormatter.string(from: now))])
+        }
+        DispatchQueue.main.async { self.lastIndexed[root] = now }
+    }
 
-            // name LIKE
-            clauses.append("name LIKE ?")
-            params.append("%\(f.query)%")
+    private func isExcluded(_ name: String, _ options: IndexOptions) -> Bool {
+        options.excludedFiles.contains { pattern in
+            pattern.hasSuffix("*") ? name.hasPrefix(String(pattern.dropLast())) : name == pattern
+        }
+    }
 
-            // extension
-            if let ft = f.fileType, !ft.isEmpty, ft.lowercased() != "all" {
-                clauses.append("extension = ?")
-                let cleaned = ft.lowercased().replacingOccurrences(of: ".", with: "")
-                params.append(cleaned)
+    private func existingRows(in root: String) -> [String: ExistingRow] {
+        var rows: [String: ExistingRow] = [:]
+        dbQueue.sync {
+            _ = query("SELECT path, size, modified_time, ocr_text IS NOT NULL, text_version FROM files WHERE folder_root = ?",
+                  [.text(root)]) {
+                rows[Self.columnText($0, 0)] = ExistingRow(
+                    size: sqlite3_column_int64($0, 1),
+                    modified: Self.columnText($0, 2),
+                    hasText: sqlite3_column_int($0, 3) == 1,
+                    textVersion: Int(sqlite3_column_int($0, 4))
+                )
             }
+        }
+        return rows
+    }
 
-            // scope by folders (path prefix)
-            if let folders = f.folders, !folders.isEmpty {
-                let orPieces = folders.map { _ in "path LIKE ?" }.joined(separator: " OR ")
-                clauses.append("(\(orPieces))")
-                params.append(contentsOf: folders.map { "\($0)%" })
-            }
+    private static let upsertSQL = """
+    INSERT INTO files (path, name, extension, size, modified_time, indexed_time, folder_root, ocr_text, text_version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+        name = excluded.name,
+        extension = excluded.extension,
+        size = excluded.size,
+        modified_time = excluded.modified_time,
+        indexed_time = excluded.indexed_time,
+        folder_root = excluded.folder_root,
+        ocr_text = excluded.ocr_text,
+        text_version = excluded.text_version
+    """
 
-            // path contains subfolder/keyword
-            if let sub = f.pathContains, !sub.isEmpty {
-                clauses.append("path LIKE ?")
-                params.append("%\(sub)%")
-            }
-
-            // modified date range
-            let iso = ISO8601DateFormatter()
-            if let after = f.modifiedAfter {
-                clauses.append("modified_time >= ?")
-                params.append(iso.string(from: after))
-            }
-            if let before = f.modifiedBefore {
-                clauses.append("modified_time <= ?")
-                params.append(iso.string(from: before))
-            }
-
-            // size
-            if let min = f.minSize { clauses.append("size >= ?"); params.append(String(min)) }
-            if let max = f.maxSize { clauses.append("size <= ?"); params.append(String(max)) }
-
-            let whereSQL = clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND ")
-            let sql = """
-            SELECT path, name, extension, size, modified_time, folder_root
-            FROM files
-            \(whereSQL)
-            ORDER BY modified_time DESC
-            LIMIT \(f.limit)
-            """
-
+    /// Writes a batch in one transaction, which is far faster than committing per file.
+    private func write(_ records: [FileRecord], root: String) {
+        let indexedAt = Self.isoFormatter.string(from: Date())
+        dbQueue.sync {
             var statement: OpaquePointer?
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                for (i, p) in params.enumerated() {
-                    sqlite3_bind_text(statement, Int32(i + 1), (p as NSString).utf8String, -1, nil)
-                }
-                let iso = ISO8601DateFormatter()
-                while sqlite3_step(statement) == SQLITE_ROW {
-                    let path = String(cString: sqlite3_column_text(statement, 0))
-                    let name = String(cString: sqlite3_column_text(statement, 1))
-                    let ext  = String(cString: sqlite3_column_text(statement, 2))
-                    let size = sqlite3_column_int64(statement, 3)
-                    let modifiedTimeString = String(cString: sqlite3_column_text(statement, 4))
-                    let folderRoot = String(cString: sqlite3_column_text(statement, 5))
-                    let modifiedTime = iso.date(from: modifiedTimeString) ?? Date()
-
-                    results.append(FileItem(
-                        path: path,
-                        name: name,
-                        fileExtension: ext,
-                        size: size,
-                        modifiedTime: modifiedTime,
-                        folderRoot: folderRoot
-                    ))
-                }
-            } else {
-                let err = String(cString: sqlite3_errmsg(db))
-                print("❌ SQL error: \(err)")
+            guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &statement, nil) == SQLITE_OK, let statement else {
+                logger.error("Prepare failed: \(self.lastError, privacy: .public)")
+                return
             }
-            sqlite3_finalize(statement)
+            defer { sqlite3_finalize(statement) }
+
+            exec("BEGIN")
+            for record in records {
+                bind([
+                    .text(record.path), .text(record.name), .text(record.ext), .int(record.size),
+                    .text(record.modified), .text(indexedAt), .text(root),
+                    record.text.map { .text($0) } ?? .null, .int(Int64(record.textVersion))
+                ], to: statement)
+                if sqlite3_step(statement) != SQLITE_DONE {
+                    logger.error("Insert failed for \(record.path, privacy: .public): \(self.lastError, privacy: .public)")
+                }
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+            }
+            exec("COMMIT")
+        }
+    }
+
+    private func deleteRows(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        dbQueue.sync {
+            exec("BEGIN")
+            for path in paths {
+                query("DELETE FROM files WHERE path = ?", [.text(path)])
+            }
+            exec("COMMIT")
+        }
+    }
+
+    // MARK: - Text extraction
+
+    private static let documentTypes: [String: NSAttributedString.DocumentType] = [
+        "doc": .docFormat, "docx": .officeOpenXML, "rtf": .rtf
+    ]
+    private static let plainTextExtensions: Set<String> = ["txt", "csv", "md", "eml", "htm", "html"]
+
+    private static func supportsTextExtraction(_ ext: String) -> Bool {
+        ext == "pdf" || ext == "msg" || documentTypes[ext] != nil
+            || plainTextExtensions.contains(ext) || imageExtensions.contains(ext)
+    }
+
+    private func extractText(from url: URL, ext: String, size: Int64) -> String? {
+        switch ext {
+        case "pdf":
+            return size < 200_000_000 ? extractPDFText(url) : nil
+        case "msg":
+            guard size < 200_000_000, let message = try? OutlookMessage(contentsOf: url) else { return nil }
+            return String(message.searchableText.prefix(Self.maxTextLength))
+        case _ where Self.documentTypes[ext] != nil:
+            // The Word/RTF importers are safe off the main thread (unlike the HTML one)
+            guard size < 100_000_000,
+                  let document = try? NSAttributedString(url: url,
+                                                         options: [.documentType: Self.documentTypes[ext]!],
+                                                         documentAttributes: nil) else { return nil }
+            return String(document.string.prefix(Self.maxTextLength))
+        case _ where Self.plainTextExtensions.contains(ext):
+            return size < 20_000_000 ? readPlainText(url, ext: ext) : nil
+        default:
+            return size < 20_000_000 ? recognizeImage(at: url) : nil
+        }
+    }
+
+    private func readPlainText(_ url: URL, ext: String) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        var text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? ""
+        switch ext {
+        case "htm", "html":
+            text = OutlookMessage.plainText(fromHTML: Data(text.utf8))
+        case "eml":
+            // Drop base64-encoded parts (attachments, images), which would only add noise
+            text = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { $0.count < 60 || $0.contains(" ") }
+                .joined(separator: "\n")
+        default:
+            break
+        }
+        return String(text.prefix(Self.maxTextLength))
+    }
+
+    /// Reads every page's text layer, and OCRs pages that have none (scans), up to a limit.
+    private func extractPDFText(_ url: URL) -> String? {
+        guard let document = PDFDocument(url: url) else { return nil }
+
+        var pages: [String] = []
+        var length = 0
+        var ocrPages = 0
+
+        for index in 0..<document.pageCount {
+            if isCancelled || length > Self.maxTextLength { break }
+            guard let page = document.page(at: index) else { continue }
+
+            var text = page.string ?? ""
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).count < 20, ocrPages < Self.maxOCRPagesPerPDF {
+                ocrPages += 1
+                text = recognizePDFPage(page) ?? text
+            }
+            pages.append(text)
+            length += text.count
+        }
+        return pages.joined(separator: "\n")
+    }
+
+    private func recognizePDFPage(_ page: PDFPage) -> String? {
+        let bounds = page.bounds(for: .mediaBox)
+        let scale = 2000 / max(bounds.width, bounds.height, 1)
+        let image = page.thumbnail(of: NSSize(width: bounds.width * scale, height: bounds.height * scale), for: .mediaBox)
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return recognizeText(in: cgImage)
+    }
+
+    private func recognizeImage(at url: URL) -> String? {
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 4096
+        ] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
+        return recognizeText(in: cgImage)
+    }
+
+    private func recognizeText(in image: CGImage) -> String? {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        do {
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        } catch {
+            logger.error("OCR failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+    }
+
+    // MARK: - Search
+
+    /// Searches names, folder paths, and extracted text. `text` accepts the syntax in
+    /// SearchQueryParser. Files whose name contains everything typed come first, then other
+    /// matches by relevance; with only filters, newest first. Safe to call from any thread except `dbQueue`.
+    func search(_ text: String, fileType: String? = nil, folders: [String] = [], limit: Int = 1000) -> [FileItem] {
+        let parsed = SearchQueryParser.parse(text)
+        var filters: [String] = []
+        var filterParams: [SQLValue] = []
+
+        if !parsed.fileTypes.isEmpty {
+            filters.append("f.extension IN (\(parsed.fileTypes.map { _ in "?" }.joined(separator: ", ")))")
+            filterParams += parsed.fileTypes.map { .text($0) }
+        }
+        if let fileType {
+            filters.append("f.extension = ?")
+            filterParams.append(.text(fileType.lowercased().replacingOccurrences(of: ".", with: "")))
+        }
+        if !folders.isEmpty {
+            filters.append("(" + folders.map { _ in "f.path LIKE ? ESCAPE '\\'" }.joined(separator: " OR ") + ")")
+            filterParams += folders.map { .text(Self.likeEscaped($0) + "/%") }
+        }
+        for fragment in parsed.pathContains {
+            filters.append("f.path LIKE ? ESCAPE '\\'")
+            filterParams.append(.text("%\(Self.likeEscaped(fragment))%"))
+        }
+        if let after = parsed.modifiedAfter {
+            filters.append("f.modified_time >= ?")
+            filterParams.append(.text(Self.isoFormatter.string(from: after)))
+        }
+        if let before = parsed.modifiedBefore {
+            filters.append("f.modified_time < ?")
+            filterParams.append(.text(Self.isoFormatter.string(from: before)))
+        }
+        if let minSize = parsed.minSize {
+            filters.append("f.size >= ?")
+            filterParams.append(.int(minSize))
+        }
+        if let maxSize = parsed.maxSize {
+            filters.append("f.size <= ?")
+            filterParams.append(.int(maxSize))
         }
 
+        let match = SearchQueryParser.ftsMatchExpression(for: parsed)
+        let nameTerms = parsed.textTokens + parsed.exactPhrases
+        guard !nameTerms.isEmpty || !filters.isEmpty else { return [] }
+
+        var results: [FileItem] = []
+        dbQueue.sync {
+            guard !nameTerms.isEmpty else {
+                results = fetchFiles(from: "files f", where: filters, filterParams, orderBy: "f.modified_time DESC", limit: limit).map(\.item)
+                return
+            }
+
+            // Word matches across names, paths, and text, ranked (fast via the full-text index)
+            var ranked: [(id: Int64, item: FileItem)] = []
+            if let match {
+                ranked = fetchFiles(from: "files_fts JOIN files f ON f.id = files_fts.rowid",
+                                    where: ["files_fts MATCH ?"] + filters, [.text(match)] + filterParams,
+                                    orderBy: "bm25(files_fts, 10.0, 2.0, 1.0)", limit: limit)
+            }
+            // Names containing what was typed anywhere, e.g. "2023" in "Budget2023.pdf",
+            // which word matching can't find. A plain scan of names is fast enough.
+            let named = fetchFiles(from: "files f",
+                                   where: nameTerms.map { _ in "f.name LIKE ? ESCAPE '\\'" } + filters,
+                                   nameTerms.map { .text("%\(Self.likeEscaped($0))%") } + filterParams,
+                                   orderBy: "f.modified_time DESC", limit: limit)
+
+            let namedPaths = Set(named.map(\.item.path))
+            let rankedPaths = Set(ranked.map(\.item.path))
+            let merged = ranked.filter { namedPaths.contains($0.item.path) }
+                + named.filter { !rankedPaths.contains($0.item.path) }
+                + ranked.filter { !namedPaths.contains($0.item.path) }
+            results = Array(merged.prefix(limit)).map(\.item)
+
+            if let match {
+                addSnippets(to: &results, ids: Dictionary(merged.map { ($0.item.path, $0.id) }, uniquingKeysWith: { a, _ in a }), match: match)
+            }
+        }
         return results
     }
 
-    
-    func search(query: String, fileType: String? = nil, folders: [String]? = nil, limit: Int = 100) -> [FileItem] {
-        var results: [FileItem] = []
-        
-        // Use serial queue to ensure thread-safe database access
-        dbQueue.sync {
-            print("🔍 Search called with query: '\(query)', fileType: \(fileType ?? "nil")")
-            
-            var sql = "SELECT path, name, extension, size, modified_time, folder_root FROM files WHERE name LIKE ?"
-            var params: [String] = ["%\(query)%"]
-            
-            if let fileType = fileType, fileType != "All" {
-                sql += " AND extension = ?"
-                params.append(fileType.lowercased().replacingOccurrences(of: ".", with: ""))
-            }
-            
-            if let folders = folders, !folders.isEmpty {
-                let placeholders = folders.map { _ in "path LIKE ?" }.joined(separator: " OR ")
-                sql += " AND (\(placeholders))"
-                params.append(contentsOf: folders.map { "\($0)%" })
-            }
-            
-            sql += " ORDER BY modified_time DESC LIMIT \(limit)"
-            
-            print("   SQL: \(sql)")
-            print("   Params: \(params)")
-            
-            var statement: OpaquePointer?
-            
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                for (index, param) in params.enumerated() {
-                    sqlite3_bind_text(statement, Int32(index + 1), (param as NSString).utf8String, -1, nil)
-                }
-                
-                let isoFormatter = ISO8601DateFormatter()
-                
-                while sqlite3_step(statement) == SQLITE_ROW {
-                    let path = String(cString: sqlite3_column_text(statement, 0))
-                    let name = String(cString: sqlite3_column_text(statement, 1))
-                    let ext = String(cString: sqlite3_column_text(statement, 2))
-                    let size = sqlite3_column_int64(statement, 3)
-                    let modifiedTimeString = String(cString: sqlite3_column_text(statement, 4))
-                    let folderRoot = String(cString: sqlite3_column_text(statement, 5))
-                    
-                    let modifiedTime = isoFormatter.date(from: modifiedTimeString) ?? Date()
-                    
-                    let item = FileItem(
-                        path: path,
-                        name: name,
-                        fileExtension: ext,
-                        size: size,
-                        modifiedTime: modifiedTime,
-                        folderRoot: folderRoot
-                    )
-                    
-                    results.append(item)
-                }
-            } else {
-                let errorMessage = String(cString: sqlite3_errmsg(db))
-                print("   ❌ SQL Error: \(errorMessage)")
-            }
-            
-            sqlite3_finalize(statement)
-            print("   ✅ Found \(results.count) results")
+    private func fetchFiles(from source: String, where clauses: [String], _ params: [SQLValue],
+                            orderBy: String, limit: Int) -> [(id: Int64, item: FileItem)] {
+        var rows: [(id: Int64, item: FileItem)] = []
+        let sql = """
+        SELECT f.id, f.path, f.name, f.extension, f.size, f.modified_time, f.folder_root
+        FROM \(source)
+        \(clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "))
+        ORDER BY \(orderBy)
+        LIMIT \(limit)
+        """
+        _ = query(sql, params) {
+            rows.append((sqlite3_column_int64($0, 0), FileItem(
+                path: Self.columnText($0, 1),
+                name: Self.columnText($0, 2),
+                fileExtension: Self.columnText($0, 3),
+                size: sqlite3_column_int64($0, 4),
+                modifiedTime: Self.isoFormatter.date(from: Self.columnText($0, 5)) ?? .distantPast,
+                folderRoot: Self.columnText($0, 6)
+            )))
         }
-        
-        return results
+        return rows
     }
-    
-    func getStats() -> (count: Int, totalSize: Int64) {
-        var count = 0
-        var totalSize: Int64 = 0
-        
-        dbQueue.sync {
-            var statement: OpaquePointer?
-            let sql = "SELECT COUNT(*), SUM(size) FROM files"
-            
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                if sqlite3_step(statement) == SQLITE_ROW {
-                    count = Int(sqlite3_column_int(statement, 0))
-                    totalSize = sqlite3_column_int64(statement, 1)
-                }
-            }
-            
-            sqlite3_finalize(statement)
+
+    /// Marks highlighted words in snippets; the UI turns these into bold text
+    static let highlightStart = "\u{2}"
+    static let highlightEnd = "\u{3}"
+
+    /// Adds a short excerpt around the match for results that matched inside the file's text.
+    /// Only the top results get one, since building excerpts means reading each file's text.
+    private func addSnippets(to results: inout [FileItem], ids: [String: Int64], match: String) {
+        let top = results.prefix(100).compactMap { ids[$0.path] }
+        guard !top.isEmpty else { return }
+
+        var snippets: [Int64: String] = [:]
+        _ = query("""
+        SELECT rowid, snippet(files_fts, 2, char(2), char(3), '…', 14)
+        FROM files_fts
+        WHERE files_fts MATCH ? AND rowid IN (\(top.map(String.init).joined(separator: ",")))
+        """, [.text("ocr_text : (\(match))")]) {
+            snippets[sqlite3_column_int64($0, 0)] = Self.columnText($0, 1)
         }
-        
-        return (count, totalSize)
+
+        for index in results.indices.prefix(100) {
+            guard let id = ids[results[index].path], let snippet = snippets[id], snippet.contains(Self.highlightStart) else { continue }
+            results[index].snippet = snippet
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        }
     }
-    
+
     func clearDatabase() {
-        dbQueue.sync {
-            var statement: OpaquePointer?
-            let sql = "DELETE FROM files"
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                sqlite3_step(statement)
-            }
-            sqlite3_finalize(statement)
-        }
-
-        // Update progress to trigger UI refresh
-        DispatchQueue.main.async {
-            self.indexProgress = 0
+        dbQueue.async {
+            self.query("DELETE FROM files")
+            self.query("DELETE FROM folder_state")
+            DispatchQueue.main.async { self.lastIndexed = [:] }
+            self.refreshStatsOnQueue()
         }
     }
 
     // MARK: - Folder Discovery
 
-    /// Returns a hierarchical structure of all indexed folders and their immediate subfolders
-    func discoverFolderHierarchy() -> [FolderNode] {
-        var folderSet = Set<String>()
-
+    /// Immediate subfolders of `parentPath` that contain indexed files (for the folder picker tree)
+    func immediateSubfolders(of parentPath: String) -> [String] {
+        // SQLite's substr/instr count Unicode code points, so measure the prefix the same way
+        let start = Int64(parentPath.unicodeScalars.count + 2)
+        var names: [String] = []
         dbQueue.sync {
-            var statement: OpaquePointer?
-            let sql = "SELECT DISTINCT path FROM files ORDER BY path"
-
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                while sqlite3_step(statement) == SQLITE_ROW {
-                    let fullPath = String(cString: sqlite3_column_text(statement, 0))
-                    let url = URL(fileURLWithPath: fullPath)
-
-                    // Add all parent directories up to (but not including) the root
-                    var currentURL = url.deletingLastPathComponent()
-                    while currentURL.path != "/" {
-                        folderSet.insert(currentURL.path)
-                        currentURL = currentURL.deletingLastPathComponent()
-                    }
-                }
-            }
-            sqlite3_finalize(statement)
-        }
-
-        // Build hierarchy from flat list
-        return buildHierarchy(from: Array(folderSet))
-    }
-
-    /// Builds a hierarchical tree from a flat list of paths
-    private func buildHierarchy(from paths: [String]) -> [FolderNode] {
-        var nodeMap: [String: FolderNode] = [:]
-        var rootNodes: [FolderNode] = []
-
-        // Sort paths to ensure parents are processed before children
-        let sortedPaths = paths.sorted()
-
-        for path in sortedPaths {
-            let url = URL(fileURLWithPath: path)
-            let parentPath = url.deletingLastPathComponent().path
-
-            // Create or get the current node
-            let node = nodeMap[path] ?? FolderNode(path: path, name: url.lastPathComponent)
-            nodeMap[path] = node
-
-            // Check if this is a root folder (in indexedFolders)
-            if indexedFolders.contains(path) {
-                rootNodes.append(node)
-            } else if let parentNode = nodeMap[parentPath] {
-                // Add as child to parent
-                if !parentNode.children.contains(where: { $0.path == path }) {
-                    parentNode.children.append(node)
-                }
+            _ = query("""
+            SELECT DISTINCT substr(path, ?1, instr(substr(path, ?1), '/') - 1)
+            FROM files
+            WHERE path LIKE ?2 ESCAPE '\\' AND instr(substr(path, ?1), '/') > 0
+            """, [.int(start), .text(Self.likeEscaped(parentPath) + "/%")]) {
+                names.append(Self.columnText($0, 0))
             }
         }
-
-        return rootNodes.sorted { $0.path < $1.path }
+        return names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .map { parentPath + "/" + $0 }
     }
-}
 
-/// Represents a folder in the hierarchy
-class FolderNode: Identifiable, ObservableObject {
-    let id = UUID()
-    let path: String
-    let name: String
-    @Published var children: [FolderNode] = []
-    @Published var isExpanded: Bool = false
-
-    init(path: String, name: String) {
-        self.path = path
-        self.name = name
+    /// Every folder that contains an indexed file (for folder search in the picker)
+    func allFolders() -> [String] {
+        var folders: [String] = []
+        dbQueue.sync {
+            _ = query("SELECT DISTINCT substr(path, 1, length(path) - length(name) - 1) FROM files") {
+                folders.append(Self.columnText($0, 0))
+            }
+        }
+        return folders.sorted()
     }
 }

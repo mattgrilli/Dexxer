@@ -9,23 +9,32 @@ import Foundation
 
 extension FileIndexer {
 
-    /// Called when a volume mounts (e.g., /Volumes/TeamShare).
-    /// If any saved indexed folder is inside that volume, re-index them.
-    func resumeIfFolderInside(mountedVolumeURL: URL) {
-        let root = mountedVolumeURL.path  // e.g., "/Volumes/TeamShare"
-        // match either the root itself or subpaths under it
-        let matches = indexedFolders.filter { $0 == root || $0.hasPrefix(root + "/") }
-        guard !matches.isEmpty else { return }
-        if !isIndexing {
-            indexFolders(matches) { _ in }
+    /// True when the folder exists and its contents can actually be listed with the access
+    /// we hold. Can block for a long time on a hung network mount, so never call it on the main thread.
+    func isReachableFolder(_ path: String) -> Bool {
+        let scopedURL = BookmarkStore.resolve(path: path)
+        let didStartScope = scopedURL?.startAccessingSecurityScopedResource() ?? false
+        defer { if didStartScope { scopedURL?.stopAccessingSecurityScopedResource() } }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            return false
         }
+        // Existence alone isn't enough: in the sandbox a folder can exist but be unreadable
+        return (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil
     }
 
-    /// Cheap reachability check (use in UI if you want to label disconnected folders).
-    func isReachableFolder(_ path: String) -> Bool {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
-              isDir.boolValue else { return false }
-        return FileManager.default.isReadableFile(atPath: path)
+    /// Check if folder is on a network volume (SMB, AFP, NFS, etc.)
+    func isNetworkFolder(_ path: String) -> Bool {
+        if path.hasPrefix("/Volumes/") {
+            return true
+        }
+
+        let url = URL(fileURLWithPath: path)
+        if let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey]),
+           let isLocal = values.volumeIsLocal {
+            return !isLocal
+        }
+        return false
     }
 }

@@ -21,8 +21,22 @@ struct DexxerApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem?
-    var indexer = FileIndexer()
+    let indexer: FileIndexer = {
+        #if DEBUG
+        if DemoMode.isEnabled { return FileIndexer(directory: DemoMode.resetDataDirectory()) }
+        #endif
+        return FileIndexer()
+    }()
+    lazy var searchModel = SearchModel(indexer: indexer)
+    lazy var quickSearch = QuickSearchController(indexer: indexer) { [weak self] query in
+        self?.openMainWindow()
+        self?.searchModel.search(for: query)
+    }
     private var mainWindow: NSWindow?
+    private var autoIndexTimer: Timer?
+
+    /// Folders not fully indexed within this long get re-indexed automatically
+    private static let staleAge: TimeInterval = 12 * 60 * 60
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
@@ -30,10 +44,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Menu-bar style app (no Dock icon). If you want Dock icon, switch to .regular.
         NSApp.setActivationPolicy(.accessory)
 
-        // Notifications (optional)
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
-        // Status item
+        // dexxer:// links (registered in Dexxer-Info.plist)
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "magnifyingglass.circle.fill", accessibilityDescription: "Dexxer")
@@ -42,65 +62,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             button.target = self
         }
 
-        // 🔔 Watch for volumes mounting/unmounting (SMB/NFS shares show up here)
+        // Keep folder status current as shares come and go
         let nc = NSWorkspace.shared.notificationCenter
-        nc.addObserver(self, selector: #selector(volumeMounted(_:)),
-                       name: NSWorkspace.didMountNotification, object: nil)
-        nc.addObserver(self, selector: #selector(volumeUnmounted(_:)),
-                       name: NSWorkspace.willUnmountNotification, object: nil)
+        nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didMountNotification, object: nil)
+        nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didUnmountNotification, object: nil)
+
+        #if DEBUG
+        if DemoMode.isEnabled {
+            DemoMode.run(self)
+            return
+        }
+        #endif
+
+        // Registers the global shortcut
+        _ = quickSearch
+
+        // Keep the index current: shortly after launch, then hourly
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+        }
+        autoIndexTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { [weak self] _ in
+            self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+        }
+    }
+
+    // MARK: - URL Scheme Handling
+
+    @objc func handleURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: urlString) else {
+            return
+        }
+        handleDexxerURL(url)
+    }
+
+    /// dexxer://search?q=contract opens the window and runs the search; anything else just opens the window.
+    /// Links can't add or index folders, since any web page can open them.
+    func handleDexxerURL(_ url: URL) {
+        guard url.scheme == "dexxer" else { return }
+        openMainWindow()
+
+        if url.host == "search",
+           let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "q" })?.value {
+            searchModel.search(for: query)
+        }
     }
 
     // MARK: - Volume notifications
 
-    @objc private func volumeMounted(_ note: Notification) {
-        guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
-        // Ask indexer to resume if any saved folder lives under this mounted volume
-        indexer.resumeIfFolderInside(mountedVolumeURL: url)
-    }
-
-    @objc private func volumeUnmounted(_ note: Notification) {
-        // Optional: you could notify the user or cancel an in-flight index here.
-        // Leaving empty keeps behavior simple.
+    @objc private func volumesChanged(_ note: Notification) {
+        indexer.refreshReachability()
+        // A share just came back: catch up on anything that changed while it was away
+        if note.name == NSWorkspace.didMountNotification {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+            }
+        }
     }
 
     // MARK: - Menu
 
     @objc func showMenu() {
+        // Uses cached status so a hung network share can't freeze the menu; refresh for next time
+        indexer.refreshReachability()
+
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🔍 Open Dexxer", action: #selector(openMainWindow), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "Open Dexxer", action: #selector(openMainWindow), keyEquivalent: "o"))
+        let quickItem = NSMenuItem(title: "Quick Search…", action: #selector(showQuickSearch), keyEquivalent: "")
+        if quickSearch.shortcut != .off {
+            quickItem.title += "  (\(quickSearch.shortcut.label))"
+        }
+        menu.addItem(quickItem)
         menu.addItem(.separator())
 
-        // Stats (local + total)
-        let stats = indexer.getStats()
-        let sizeStr = ByteCountFormatter.string(fromByteCount: stats.totalSize, countStyle: .file)
-        let statsItem = NSMenuItem(title: "📊 \(stats.count.formatted()) files (\(sizeStr))", action: nil, keyEquivalent: "")
-        statsItem.isEnabled = false
-        menu.addItem(statsItem)
+        let stats = indexer.stats
+        if stats.count > 0 {
+            let sizeStr = ByteCountFormatter.string(fromByteCount: stats.totalSize, countStyle: .file)
+            addInfoItem("\(stats.count.formatted()) files indexed (\(sizeStr))", to: menu)
+        } else {
+            addInfoItem("No files indexed yet", to: menu)
+        }
 
-        // Network summary
-        let networkFolders = indexer.indexedFolders.filter { isNetworkPath($0) }
+        let networkFolders = indexer.indexedFolders.filter { indexer.isNetworkFolder($0) }
+        let offline = networkFolders.filter { !indexer.isReachable($0) }.count
         if !networkFolders.isEmpty {
-            let connected = networkFolders.filter { indexer.isReachableFolder($0) }.count
-            let disconnected = networkFolders.count - connected
-            let net = NSMenuItem(title: "🌐 Network: \(connected) connected, \(disconnected) disconnected", action: nil, keyEquivalent: "")
-            net.isEnabled = false
-            menu.addItem(net)
+            if offline > 0 {
+                addInfoItem("⚠️ \(offline) network share\(offline == 1 ? "" : "s") offline", to: menu)
+            } else {
+                addInfoItem("Network shares connected", to: menu)
+            }
         }
 
         menu.addItem(.separator())
 
         if indexer.isIndexing {
-            let indexingItem = NSMenuItem(title: "⏳ Indexing... \(indexer.indexProgress) files", action: nil, keyEquivalent: "")
-            indexingItem.isEnabled = false
-            menu.addItem(indexingItem)
+            if indexer.isCancellingIndex {
+                addInfoItem("Stopping…", to: menu)
+            } else {
+                addInfoItem("Indexing… \(indexer.indexProgress.formatted()) files checked", to: menu)
+                menu.addItem(NSMenuItem(title: "Stop Indexing", action: #selector(cancelIndexing), keyEquivalent: ""))
+            }
         } else {
-            let re = NSMenuItem(title: "🔄 Quick Re-Index", action: #selector(quickReindex), keyEquivalent: "")
-            menu.addItem(re)
+            let folders = indexer.indexedFolders
+            if folders.isEmpty {
+                menu.addItem(NSMenuItem(title: "Add Folders to Index…", action: #selector(openMainWindow), keyEquivalent: ""))
+            } else {
+                menu.addItem(NSMenuItem(title: "Re-Index All", action: #selector(quickReindex), keyEquivalent: "r"))
+
+                if folders.count > 1 {
+                    let folderSubmenu = NSMenu()
+                    for folder in folders {
+                        let item = NSMenuItem(title: FolderActions.displayName(folder), action: #selector(reindexFolder(_:)), keyEquivalent: "")
+                        item.representedObject = folder
+                        item.target = self
+                        item.isEnabled = indexer.isReachable(folder)
+                        folderSubmenu.addItem(item)
+                    }
+                    folderSubmenu.autoenablesItems = false
+                    let folderMenuItem = NSMenuItem(title: "Re-Index Folder", action: nil, keyEquivalent: "")
+                    folderMenuItem.submenu = folderSubmenu
+                    menu.addItem(folderMenuItem)
+                }
+            }
         }
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "ℹ️ About Dexxer", action: #selector(showAbout), keyEquivalent: ""))
-        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "About Dexxer", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit Dexxer", action: #selector(quitApp), keyEquivalent: "q"))
 
         statusItem?.menu = menu
@@ -108,16 +195,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem?.menu = nil
     }
 
+    private func addInfoItem(_ title: String, to menu: NSMenu) {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
+    @objc func reindexFolder(_ sender: NSMenuItem) {
+        guard let folder = sender.representedObject as? String else { return }
+        let folderName = FolderActions.displayName(folder)
+        indexer.indexFolders([folder]) { count in
+            self.sendNotification(title: "Dexxer", body: "Checked \(count.formatted()) files in \(folderName).")
+        }
+    }
+
+    @objc func showQuickSearch() {
+        quickSearch.show()
+    }
 
     // MARK: - Window
 
     @objc func openMainWindow() {
         if mainWindow == nil {
-            let w = createWindow(title: "Dexxer", width: 1100, height: 750)
-            w.delegate = self
-            w.isReleasedWhenClosed = false
-            w.contentView = NSHostingView(rootView: MainView(indexer: indexer))
-            mainWindow = w
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1200, height: 760),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Dexxer"
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.contentView = NSHostingView(rootView: MainView(indexer: indexer, search: searchModel, quickSearch: quickSearch))
+            window.center()
+            window.setFrameAutosaveName("DexxerMainWindow")
+            mainWindow = window
         }
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -133,45 +245,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
-    private func createWindow(title: String, width: CGFloat, height: CGFloat) -> NSWindow {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.center()
-        window.title = title
-        window.isReleasedWhenClosed = false
-        return window
-    }
-
     // MARK: - Actions
 
     @objc func quickReindex() {
-        if indexer.isIndexing {
-            showAlert(title: "Already Indexing", message: "Please wait for the current indexing task to finish.")
+        guard !indexer.indexedFolders.isEmpty else {
+            openMainWindow()
             return
         }
-        if indexer.indexedFolders.isEmpty {
-            showAlert(title: "No Folders", message: "Please add folders first in Manage Folders.")
-            return
-        }
-        sendNotification(title: "Dexxer", body: "Re-indexing all folders...")
         indexer.indexFolders { count in
-            DispatchQueue.main.async {
-                self.sendNotification(title: "Dexxer", body: "Indexed \(count) files!")
-            }
+            self.sendNotification(title: "Dexxer", body: "Re-index finished: checked \(count.formatted()) files.")
         }
     }
 
-    @objc func showAbout() {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+    @objc func cancelIndexing() {
+        indexer.cancelIndexing()
+    }
 
-        showAlert(
-            title: "About Dexxer",
-            message: """
+    @objc func showAbout() {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+
+        NSApp.activate(ignoringOtherApps: true)
+        infoAlert("About Dexxer", """
             Version \(version) (\(build))
             Created by Matt Grilli © 2025
 
@@ -181,13 +276,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             Built with Swift, SQLite, and determination.
 
-            🔍 Fast local file indexing
-            📊 Search thousands of files instantly
-            💪 No BS, just results
-            """
-        )
-    }
+            🔍 Features:
+            • Full-text search ranked by best match
+            • Search syntax (type:, size:, modified:, path:)
+            • Text from PDFs, images, and scanned pages
+            • Network share support
+            • Fast re-indexing of only what changed
+            • Quick Look previews
+            • Saved folder selections
 
+            💪 No cloud. No tracking. Just local, fast search.
+            """)
+    }
 
     @objc func quitApp() {
         NSApplication.shared.terminate(nil)
@@ -195,20 +295,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - Helpers
 
-    private func showAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
     private func sendNotification(title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
