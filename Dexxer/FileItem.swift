@@ -64,8 +64,17 @@ struct FileItem: Identifiable, Hashable {
         URL(fileURLWithPath: path)
     }
 
-    /// Folder containing the file, shown under the name in results
+    /// Folder containing the file
     var parentPath: String {
         (path as NSString).deletingLastPathComponent
+    }
+
+    /// Where the file is, starting from its indexed folder: "Maple Ridge HOA › Vendors & Contracts".
+    /// Shown under the name in results; the full path is in the preview and tooltip.
+    var location: String {
+        let parent = parentPath
+        guard !folderRoot.isEmpty, parent == folderRoot || parent.hasPrefix(folderRoot + "/") else { return parent }
+        let subfolders = parent.dropFirst(folderRoot.count).split(separator: "/").map(String.init)
+        return ([(folderRoot as NSString).lastPathComponent] + subfolders).joined(separator: " › ")
     }
 }

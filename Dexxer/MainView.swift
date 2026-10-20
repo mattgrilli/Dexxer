@@ -14,6 +14,7 @@ struct MainView: View {
     @StateObject private var scopesStore = ScopesStore()
     @State private var selectedView: NavigationItem = .search
     @State private var isDropTargeted = false
+    @State private var columnVisibility = NavigationSplitViewVisibility.demoAware
 
     enum NavigationItem: String, CaseIterable {
         case search = "Search"
@@ -28,7 +29,7 @@ struct MainView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             VStack(spacing: 0) {
                 List(selection: $selectedView) {
                     Section {
@@ -93,6 +94,7 @@ struct SidebarFolderRow: View {
     private func lastIndexedSummary(count: Int) -> String {
         let files = "\(count.formatted()) files"
         guard let date = indexer.lastIndexed[folder] else { return "\(files) · not fully indexed" }
+        if Date().timeIntervalSince(date) < 60 { return "\(files) · just now" }
         return "\(files) · \(date.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated)))"
     }
 
@@ -351,5 +353,21 @@ enum FolderActions {
                       "Its \(count.formatted()) indexed files will no longer show up in search. Nothing on disk is changed.",
                       confirmButton: "Remove") else { return }
         indexer.removeFolder(folder)
+    }
+}
+
+/// True while generating the README screenshot (debug builds only)
+var isDemoScreenshot: Bool {
+    #if DEBUG
+    return DemoMode.isEnabled
+    #else
+    return false
+    #endif
+}
+
+extension NavigationSplitViewVisibility {
+    /// Demo screenshots can't capture the floating glass sidebar, so they hide it
+    static var demoAware: NavigationSplitViewVisibility {
+        isDemoScreenshot ? .detailOnly : .automatic
     }
 }

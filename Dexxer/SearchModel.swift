@@ -114,7 +114,7 @@ final class SearchModel: ObservableObject {
                     self.results = found
                     self.facets = Dictionary(grouping: found, by: \.folderRoot)
                         .map { Facet(root: $0.key, count: $0.value.count) }
-                        .sorted { $0.count > $1.count }
+                        .sorted { $0.count != $1.count ? $0.count > $1.count : $0.name < $1.name }
                     if let root = self.rootFilter, !self.facets.contains(where: { $0.root == root }) {
                         self.rootFilter = nil
                     }

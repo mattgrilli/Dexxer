@@ -21,7 +21,12 @@ struct DexxerApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem?
-    let indexer = FileIndexer()
+    let indexer: FileIndexer = {
+        #if DEBUG
+        if DemoMode.isEnabled { return FileIndexer(directory: DemoMode.resetDataDirectory()) }
+        #endif
+        return FileIndexer()
+    }()
     lazy var searchModel = SearchModel(indexer: indexer)
     lazy var quickSearch = QuickSearchController(indexer: indexer) { [weak self] query in
         self?.openMainWindow()
@@ -61,6 +66,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didMountNotification, object: nil)
         nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didUnmountNotification, object: nil)
+
+        #if DEBUG
+        if DemoMode.isEnabled {
+            DemoMode.run(self)
+            return
+        }
+        #endif
 
         // Registers the global shortcut
         _ = quickSearch

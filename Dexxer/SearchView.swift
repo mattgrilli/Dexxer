@@ -436,11 +436,12 @@ struct FileRowView: View {
                     .font(.system(size: 13))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(item.parentPath)
+                Text(item.location)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .truncationMode(.head)
+                    .truncationMode(.middle)
+                    .help(item.path)
                 if let snippet = item.highlightedSnippet {
                     Text(snippet)
                         .font(.system(size: 11))
@@ -477,7 +478,7 @@ struct FileRowView: View {
         .padding(.vertical, 6)
         .background(rowBackground)
         .contentShape(Rectangle())
-        .onHover { isHovered = $0 }
+        .onHover { isHovered = $0 && !isDemoScreenshot }
         .onTapGesture(perform: onSelect)
         .simultaneousGesture(TapGesture(count: 2).onEnded(onOpen))
         .draggable(item.fileURL)

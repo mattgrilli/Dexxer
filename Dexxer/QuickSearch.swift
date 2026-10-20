@@ -263,8 +263,8 @@ private struct QuickResultRow: View {
                     if let snippet = item.highlightedSnippet {
                         Text(snippet)
                     } else {
-                        Text(item.parentPath)
-                            .truncationMode(.head)
+                        Text(item.location)
+                            .truncationMode(.middle)
                     }
                 }
                 .font(.caption)
