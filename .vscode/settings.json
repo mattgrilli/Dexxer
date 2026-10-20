@@ -1,0 +1,10 @@
+{
+  "swift.sourcekit-lsp.serverPath": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/sourcekit-lsp",
+  "swift.path": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+  "swift.disableAutoResolve": true,
+  "swift.autoGenerateLaunchConfigurations": false,
+  "files.exclude": {
+    "**/.DS_Store": true,
+    "**/xcuserdata": true
+  }
+}

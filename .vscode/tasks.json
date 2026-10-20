@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Dexxer: Build",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh",
+      "args": ["build"],
+      "group": "build",
+      "problemMatcher": {
+        "owner": "swift",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+): (error|warning): (.*)$",
+          "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+        }
+      }
+    },
+    {
+      "label": "Dexxer: Run",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh",
+      "args": ["run"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": {
+        "owner": "swift",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+): (error|warning): (.*)$",
+          "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+        }
+      }
+    },
+    {
+      "label": "Dexxer: Test",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh",
+      "args": ["test"],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Dexxer: Clean",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh",
+      "args": ["clean"],
+      "problemMatcher": []
+    }
+  ]
+}
