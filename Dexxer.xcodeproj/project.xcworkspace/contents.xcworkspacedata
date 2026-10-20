@@ -4,4 +4,67 @@
    <FileRef
       location = "self:">
    </FileRef>
+   <FileRef
+      location = "group:ARCHITECTURE_DIAGRAMS.md">
+   </FileRef>
+   <FileRef
+      location = "group:FileIndexer_Improved_Example.swift">
+   </FileRef>
+   <FileRef
+      location = "group:FileIndexer_Improved_Example 2.swift">
+   </FileRef>
+   <FileRef
+      location = "group:SearchQueryParser.swift">
+   </FileRef>
+   <FileRef
+      location = "group:SearchQueryParserTests.swift">
+   </FileRef>
+   <FileRef
+      location = "group:SearchSyntaxGuideView.swift">
+   </FileRef>
+   <FileRef
+      location = "group:FTS5_IMPLEMENTATION.md">
+   </FileRef>
+   <FileRef
+      location = "group:SearchQuickStart.swift">
+   </FileRef>
+   <FileRef
+      location = "group:FTS5_SETUP_GUIDE.md">
+   </FileRef>
+   <FileRef
+      location = "group:OCR_FEATURE_GUIDE.md">
+   </FileRef>
+   <FileRef
+      location = "group:ShareExtension.swift">
+   </FileRef>
+   <FileRef
+      location = "group:ShareExtension-Info.plist">
+   </FileRef>
+   <FileRef
+      location = "group:URL_SCHEME_GUIDE.md">
+   </FileRef>
+   <FileRef
+      location = "group:INFO_PLIST_SETUP.md">
+   </FileRef>
+   <FileRef
+      location = "group:FinderSync.swift">
+   </FileRef>
+   <FileRef
+      location = "group:FinderSync-Info.plist">
+   </FileRef>
+   <FileRef
+      location = "group:FINDER_SYNC_GUIDE.md">
+   </FileRef>
+   <FileRef
+      location = "group:SYSTEM_INTEGRATION_SUMMARY.md">
+   </FileRef>
+   <FileRef
+      location = "group:README.md">
+   </FileRef>
+   <FileRef
+      location = "group:LICENSE">
+   </FileRef>
+   <FileRef
+      location = "group:setup_git.sh">
+   </FileRef>
 </Workspace>
