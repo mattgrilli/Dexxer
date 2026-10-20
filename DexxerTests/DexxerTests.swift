@@ -7,6 +7,7 @@
 
 import XCTest
 import AppKit
+import SQLite3
 @testable import Dexxer
 
 final class SearchQueryParserTests: XCTestCase {
@@ -70,6 +71,11 @@ final class FileIndexerTests: XCTestCase {
         try write("a/notes.txt")
         try write("ab/other.txt")
         try write("node_modules/dependency.js")
+        try write("ab/Budget2023.dat")
+        try writeDocument("docs/minutes.docx", "Pelican fence approval", type: .officeOpenXML)
+        try writeDocument("docs/letter.rtf", "Walrus parking notice", type: .rtf)
+        try Data("<html><body><p>Flamingo <b>pool</b> hours</p></body></html>".utf8)
+            .write(to: root.appendingPathComponent("docs/page.html"))
 
         indexer = FileIndexer(directory: workDir)
         indexer.ocrEnabled = true
@@ -101,6 +107,14 @@ final class FileIndexerTests: XCTestCase {
         }
     }
 
+    private func writeDocument(_ relativePath: String, _ text: String, type: NSAttributedString.DocumentType) throws {
+        let url = root.appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let document = NSAttributedString(string: text)
+        try document.data(from: NSRange(location: 0, length: document.length),
+                          documentAttributes: [.documentType: type]).write(to: url)
+    }
+
     private func index() {
         let done = expectation(description: "indexed")
         indexer.indexFolders { _ in done.fulfill() }
@@ -118,7 +132,23 @@ final class FileIndexerTests: XCTestCase {
         XCTAssertEqual(names("invo"), ["invoice-2024.pdf"], "partial words match")
         XCTAssertEqual(names("zebra"), ["invoice-2024.pdf"], "PDF text is searchable")
         XCTAssertEqual(names("type:txt"), ["notes.txt", "other.txt"])
+        XCTAssertEqual(names("pelican"), ["minutes.docx"], "Word text is searchable")
+        XCTAssertEqual(names("walrus"), ["letter.rtf"], "RTF text is searchable")
+        XCTAssertEqual(names("flamingo pool"), ["page.html"], "HTML text is searchable without tags")
         XCTAssertTrue(names("dependency").isEmpty, "excluded folders are skipped")
+    }
+
+    func testMatchesInsideNamesAndRanksNameMatchesFirst() {
+        index()
+        XCTAssertEqual(names("2023"), ["Budget2023.dat"], "text inside a word in the name matches")
+        XCTAssertEqual(indexer.search("zebra pdf").first?.name, "invoice-2024.pdf")
+    }
+
+    func testContentMatchesGetHighlightedSnippets() {
+        index()
+        let result = indexer.search("zebra").first
+        XCTAssertEqual(result?.snippet?.contains("\(FileIndexer.highlightStart)zebra\(FileIndexer.highlightEnd)"), true)
+        XCTAssertNil(indexer.search("invoice").first?.snippet, "name-only matches have no snippet")
     }
 
     func testFolderFilterDoesNotMatchSiblingPrefix() {
@@ -137,10 +167,46 @@ final class FileIndexerTests: XCTestCase {
     func testReindexPicksUpAddedAndDeletedFiles() throws {
         index()
         try FileManager.default.removeItem(at: root.appendingPathComponent("a/notes.txt"))
-        try write("a/minutes.txt")
+        try write("a/agenda.txt")
         index()
         XCTAssertTrue(names("notes").isEmpty)
-        XCTAssertEqual(names("minutes"), ["minutes.txt"])
+        XCTAssertEqual(names("agenda"), ["agenda.txt"])
+    }
+
+    func testRecordsLastCompletedScan() {
+        let path = root.standardizedFileURL.path
+        XCTAssertNil(indexer.lastIndexed[path])
+        index()
+        let first = try? XCTUnwrap(indexer.lastIndexed[path])
+        XCTAssertNotNil(first)
+
+        // Survives a relaunch
+        let reopened = FileIndexer(directory: workDir)
+        XCTAssertEqual(reopened.lastIndexed[path]?.timeIntervalSince1970 ?? 0,
+                       first?.timeIntervalSince1970 ?? -1, accuracy: 1)
+    }
+
+    func testUpgradesIndexMissingExtractedText() throws {
+        // Databases from early versions had a search index without the ocr_text column
+        let legacyDir = workDir.appendingPathComponent("legacy")
+        try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(legacyDir.appendingPathComponent(".dexxer.db").path, &db), SQLITE_OK)
+        let legacySchema = """
+        CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE, name TEXT, extension TEXT,
+            size INTEGER, modified_time TEXT, indexed_time TEXT, folder_root TEXT, ocr_text TEXT);
+        CREATE VIRTUAL TABLE files_fts USING fts5(name, path, content='files', content_rowid='id');
+        CREATE TRIGGER files_fts_insert AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+        END;
+        INSERT INTO files (path, name, extension, size, modified_time, indexed_time, folder_root, ocr_text)
+        VALUES ('/x/scan.jpg', 'scan.jpg', 'jpg', 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '/x', 'kangaroo crossing');
+        """
+        XCTAssertEqual(sqlite3_exec(db, legacySchema, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+
+        let upgraded = FileIndexer(directory: legacyDir)
+        XCTAssertEqual(upgraded.search("kangaroo").map(\.name), ["scan.jpg"])
     }
 
     func testRemoveFolderDeletesItsRows() {

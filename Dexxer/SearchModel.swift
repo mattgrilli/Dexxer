@@ -34,11 +34,24 @@ final class SearchModel: ObservableObject {
     @Published var fileType = "All"
     @Published var folderFilter: Set<String> = []
     @Published var sortOrder: SortOrder = .relevance {
-        didSet { rows = sorted(results) }
+        didSet { updateRows() }
     }
     @Published var selection: FileItem.ID?
     @Published var showPreview = false
     @Published private(set) var rows: [FileItem] = []
+    /// Indexed folder (e.g. a community) to narrow the current results to; nil shows all
+    @Published var rootFilter: String? {
+        didSet { updateRows() }
+    }
+    /// Result counts per indexed folder, for the filter chips
+    @Published private(set) var facets: [Facet] = []
+
+    struct Facet: Identifiable {
+        let root: String
+        let count: Int
+        var id: String { root }
+        var name: String { URL(fileURLWithPath: root).lastPathComponent }
+    }
     @Published private(set) var isSearching = false
     @Published private(set) var recentSearches: [String] = []
     /// Bumped to ask the search field to take focus
@@ -82,6 +95,7 @@ final class SearchModel: ObservableObject {
         guard !query.isEmpty else {
             results = []
             rows = []
+            facets = []
             selection = nil
             isSearching = false
             return
@@ -98,11 +112,14 @@ final class SearchModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self, currentGeneration == self.generation else { return }
                     self.results = found
-                    self.rows = self.sorted(found)
-                    self.isSearching = false
-                    if !self.rows.contains(where: { $0.id == self.selection }) {
-                        self.selection = self.rows.first?.id
+                    self.facets = Dictionary(grouping: found, by: \.folderRoot)
+                        .map { Facet(root: $0.key, count: $0.value.count) }
+                        .sorted { $0.count > $1.count }
+                    if let root = self.rootFilter, !self.facets.contains(where: { $0.root == root }) {
+                        self.rootFilter = nil
                     }
+                    self.updateRows()
+                    self.isSearching = false
                 }
             }
         }
@@ -115,6 +132,13 @@ final class SearchModel: ObservableObject {
         text = query
         search(debounce: false)
         requestFocus()
+    }
+
+    private func updateRows() {
+        rows = sorted(rootFilter.map { root in results.filter { $0.folderRoot == root } } ?? results)
+        if !rows.contains(where: { $0.id == selection }) {
+            selection = rows.first?.id
+        }
     }
 
     private func sorted(_ items: [FileItem]) -> [FileItem] {

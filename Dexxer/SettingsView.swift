@@ -6,15 +6,43 @@
 //
 
 import SwiftUI
+import ServiceManagement
 
 struct SettingsContentView: View {
     @ObservedObject var indexer: FileIndexer
+    @ObservedObject var quickSearch: QuickSearchController
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var dbSize = "—"
     @State private var isRebuilding = false
     @State private var isDropTargeted = false
 
     var body: some View {
         Form {
+            Section("General") {
+                Toggle("Open Dexxer when you log in", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, enabled in setLaunchAtLogin(enabled) }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Quick search shortcut", selection: $quickSearch.shortcut) {
+                        ForEach(QuickSearchController.Shortcut.allCases) { shortcut in
+                            Text(shortcut.label).tag(shortcut)
+                        }
+                    }
+                    Text(quickSearch.shortcutUnavailable
+                         ? "Another app is already using this shortcut. Pick a different one."
+                         : "Opens a search box over any app, like Spotlight. Return opens the selected file.")
+                        .font(.caption)
+                        .foregroundStyle(quickSearch.shortcutUnavailable ? Color.orange : Color.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Keep the index up to date automatically", isOn: $indexer.autoReindexEnabled)
+                    Text("Re-indexes folders that haven't been updated in 12 hours, including when a share reconnects. Only new and changed files are read.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section {
                 if indexer.indexedFolders.isEmpty {
                     Text("No folders yet. Add one, or drag folders here.")
@@ -44,8 +72,8 @@ struct SettingsContentView: View {
 
             Section("Indexing") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Extract text from PDFs and images", isOn: $indexer.ocrEnabled)
-                    Text("Reads the text in PDFs and recognizes text in images and scanned pages, so you can search by what's inside a file. Indexing is slower with this on. Takes effect the next time folders are indexed.")
+                    Toggle("Extract text from documents, emails, and images", isOn: $indexer.ocrEnabled)
+                    Text("Reads the text in Word, PDF, RTF, HTML, text, and Outlook email files, and recognizes text in images and scanned pages, so you can search by what's inside a file. Indexing is slower with this on. Takes effect the next time folders are indexed.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -98,6 +126,21 @@ struct SettingsContentView: View {
         }
         .onAppear { calculateDBSize() }
         .onChange(of: indexer.stats) { _, _ in calculateDBSize() }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        // Also called when a failed change resets the toggle; nothing to do then
+        guard enabled != (SMAppService.mainApp.status == .enabled) else { return }
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            infoAlert("Couldn't Change Login Setting", error.localizedDescription)
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     private func calculateDBSize() {
@@ -159,9 +202,17 @@ private struct SettingsFolderRow: View {
                 ProgressView()
                     .controlSize(.small)
             } else {
-                Text("\((indexer.folderFileCounts[folder] ?? 0).formatted()) files")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\((indexer.folderFileCounts[folder] ?? 0).formatted()) files")
+                    if let date = indexer.lastIndexed[folder] {
+                        Text("Indexed \(date.formatted(.relative(presentation: .named)))")
+                            .help(date.formatted(date: .abbreviated, time: .shortened))
+                    } else {
+                        Text("Not fully indexed yet")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Button {

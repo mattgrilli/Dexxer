@@ -253,6 +253,10 @@ struct SearchContentView: View {
 
     private var resultsList: some View {
         VStack(spacing: 0) {
+            if model.facets.count > 1 {
+                FacetBar(model: model)
+                Divider()
+            }
             ResultsHeader(model: model)
             Divider()
             ScrollViewReader { proxy in
@@ -327,6 +331,49 @@ struct SearchContentView: View {
     }
 }
 
+// MARK: - Folder chips
+
+/// One chip per indexed folder (community) in the results, to narrow them with one click
+struct FacetBar: View {
+    @ObservedObject var model: SearchModel
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                chip("All", count: model.facets.reduce(0) { $0 + $1.count }, isOn: model.rootFilter == nil) {
+                    model.rootFilter = nil
+                }
+                ForEach(model.facets) { facet in
+                    chip(facet.name, count: facet.count, isOn: model.rootFilter == facet.root) {
+                        model.rootFilter = model.rootFilter == facet.root ? nil : facet.root
+                    }
+                    .help(facet.root)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+
+    private func chip(_ title: String, count: Int, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .lineLimit(1)
+                Text(count.formatted())
+                    .foregroundStyle(isOn ? Color.white.opacity(0.85) : Color.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(isOn ? Color.accentColor : Color.primary.opacity(0.07))
+            .foregroundStyle(isOn ? Color.white : Color.primary)
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Results header
 
 struct ResultsHeader: View {
@@ -394,6 +441,12 @@ struct FileRowView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.head)
+                if let snippet = item.highlightedSnippet {
+                    Text(snippet)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -517,8 +570,15 @@ struct PreviewPane: View {
 
             Divider()
 
-            QuickLookPreview(url: item.fileURL, folderRoot: item.folderRoot)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Group {
+                // Quick Look can't show Outlook messages, so render them ourselves
+                if item.fileExtension == "msg" {
+                    MessagePreview(item: item)
+                } else {
+                    QuickLookPreview(url: item.fileURL, folderRoot: item.folderRoot)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
 
@@ -559,7 +619,8 @@ struct QuickLookPreview: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: QLPreviewView, coordinator: Coordinator) {
-        nsView.close()
+        // Don't call close(): QLPreviewView asserts (and aborts the app) when closed during teardown
+        nsView.previewItem = nil
         coordinator.endAccess()
     }
 
@@ -589,6 +650,119 @@ struct QuickLookPreview: NSViewRepresentable {
 
         deinit {
             endAccess()
+        }
+    }
+}
+
+/// Headers, attachments, and body of an Outlook .msg file
+struct MessagePreview: View {
+    let item: FileItem
+    @State private var message: OutlookMessage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let message {
+                content(message)
+            } else if failed {
+                EmptyStateView(icon: "envelope.badge",
+                               title: "Can't Read This Message",
+                               message: "The file may be damaged or may not be an Outlook message.") { EmptyView() }
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: item.path) {
+            message = nil
+            failed = false
+            let url = item.fileURL
+            let root = item.folderRoot
+            let loaded = await Task.detached(priority: .userInitiated) {
+                BookmarkStore.withAccess(to: root) { try? OutlookMessage(contentsOf: url) }
+            }.value
+            message = loaded
+            failed = loaded == nil
+        }
+    }
+
+    private func content(_ message: OutlookMessage) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message.subject.isEmpty ? "(No subject)" : message.subject)
+                    .font(.title3.weight(.semibold))
+                    .textSelection(.enabled)
+                header("From", message.from)
+                header("To", message.to)
+                header("Cc", message.cc)
+                if let date = message.date {
+                    header("Date", date.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+
+            if !message.attachments.isEmpty {
+                Divider()
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(message.attachments) { attachment in
+                            Button {
+                                open(attachment, from: message)
+                            } label: {
+                                Label(attachment.name, systemImage: "paperclip")
+                                    .lineLimit(1)
+                            }
+                            .help("Open \(attachment.name) (\(ByteCountFormatter.string(fromByteCount: Int64(attachment.size), countStyle: .file)))")
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+
+            Divider()
+
+            ScrollView {
+                // Very long bodies make Text slow to lay out
+                Text(message.body.isEmpty ? "(No text body)" : String(message.body.prefix(100_000)))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func header(_ label: String, _ value: String) -> some View {
+        if !value.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(label)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, alignment: .trailing)
+                Text(value)
+                    .textSelection(.enabled)
+            }
+            .font(.callout)
+        }
+    }
+
+    /// Copies the attachment to a temporary folder and opens it in its default app
+    private func open(_ attachment: OutlookMessage.Attachment, from message: OutlookMessage) {
+        guard let data = message.data(for: attachment) else {
+            infoAlert("Can't Open Attachment", "“\(attachment.name)” is an attached email, which can't be opened on its own yet.")
+            return
+        }
+        let safeName = attachment.name.replacingOccurrences(of: "[/:]", with: "-", options: .regularExpression)
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Attachments", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = folder.appendingPathComponent(safeName)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try data.write(to: url)
+            NSWorkspace.shared.open(url)
+        } catch {
+            infoAlert("Can't Open Attachment", error.localizedDescription)
         }
     }
 }

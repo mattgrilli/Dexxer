@@ -43,6 +43,8 @@ final class FileIndexer: ObservableObject {
     /// Files scanned so far in the current run
     @Published private(set) var indexProgress = 0
     @Published private(set) var currentlyIndexing: String?
+    /// File whose text is being extracted, when that is what the run is waiting on
+    @Published private(set) var currentFileName: String?
     @Published private(set) var stats = IndexStats()
     @Published private(set) var folderFileCounts: [String: Int] = [:]
     /// Last known reachability per indexed folder. Checked off the main thread because a hung
@@ -50,12 +52,17 @@ final class FileIndexer: ObservableObject {
     @Published private(set) var reachability: [String: Bool] = [:]
     /// Folders the last run skipped because they were offline
     @Published private(set) var lastSkippedFolders: [String] = []
+    /// When each folder last finished a complete scan (stopped or interrupted runs don't count)
+    @Published private(set) var lastIndexed: [String: Date] = [:]
 
     @Published var excludePatternsEnabled: Bool {
         didSet { UserDefaults.standard.set(excludePatternsEnabled, forKey: Keys.excludePatterns) }
     }
     @Published var ocrEnabled: Bool {
         didSet { UserDefaults.standard.set(ocrEnabled, forKey: Keys.ocr) }
+    }
+    @Published var autoReindexEnabled: Bool {
+        didSet { UserDefaults.standard.set(autoReindexEnabled, forKey: Keys.autoReindex) }
     }
 
     let excludedFolders = [".git", ".svn", "node_modules", ".Trash", "__pycache__", ".cache", "venv", "build", "dist", ".idea", ".vscode"]
@@ -70,6 +77,7 @@ final class FileIndexer: ObservableObject {
     private enum Keys {
         static let excludePatterns = "DexxerExcludePatternsEnabled"
         static let ocr = "DexxerOCREnabled"
+        static let autoReindex = "DexxerAutoReindex"
     }
 
     /// Bump when text extraction improves so existing rows get re-extracted.
@@ -87,6 +95,7 @@ final class FileIndexer: ObservableObject {
         let defaults = UserDefaults.standard
         excludePatternsEnabled = defaults.object(forKey: Keys.excludePatterns) as? Bool ?? true
         ocrEnabled = defaults.object(forKey: Keys.ocr) as? Bool ?? false
+        autoReindexEnabled = defaults.object(forKey: Keys.autoReindex) as? Bool ?? true
         // Leftovers from the old crash-recovery scheme, which deleted data on relaunch
         defaults.removeObject(forKey: "DexxerIndexingInProgress")
         defaults.removeObject(forKey: "DexxerLastIndexedFolder")
@@ -210,6 +219,24 @@ final class FileIndexer: ObservableObject {
         exec("CREATE INDEX IF NOT EXISTS idx_modified ON files(modified_time)")
 
         createFTSTable()
+
+        var hasFolderState = false
+        query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'folder_state')") {
+            hasFolderState = sqlite3_column_int($0, 0) == 1
+        }
+        exec("""
+        CREATE TABLE IF NOT EXISTS folder_state (
+            root TEXT PRIMARY KEY,
+            last_indexed TEXT NOT NULL
+        )
+        """)
+        if !hasFolderState {
+            // Upgrading: approximate from the newest row written for each folder
+            exec("INSERT INTO folder_state SELECT folder_root, MAX(indexed_time) FROM files WHERE folder_root IS NOT NULL GROUP BY folder_root")
+        }
+        query("SELECT root, last_indexed FROM folder_state") {
+            lastIndexed[Self.columnText($0, 0)] = Self.isoFormatter.date(from: Self.columnText($0, 1))
+        }
     }
 
     private func columnExists(_ column: String) -> Bool {
@@ -221,6 +248,25 @@ final class FileIndexer: ObservableObject {
     }
 
     private func createFTSTable() {
+        // Early versions created the index without ocr_text, and CREATE ... IF NOT EXISTS never
+        // upgrades it, so extracted text was stored but never searchable. Recreate it here;
+        // verifyFTSIndex then sees it's empty and rebuilds it from the files table.
+        var hasTextColumn = true
+        query("SELECT COUNT(*) FROM pragma_table_info('files_fts') WHERE name = 'ocr_text'") {
+            hasTextColumn = sqlite3_column_int($0, 0) > 0
+        }
+        var ftsExists = false
+        query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'files_fts')") {
+            ftsExists = sqlite3_column_int($0, 0) == 1
+        }
+        if ftsExists && !hasTextColumn {
+            logger.warning("Search index is missing extracted text; recreating it")
+            exec("DROP TRIGGER IF EXISTS files_fts_insert")
+            exec("DROP TRIGGER IF EXISTS files_fts_delete")
+            exec("DROP TRIGGER IF EXISTS files_fts_update")
+            exec("DROP TABLE files_fts")
+        }
+
         exec("""
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
             name, path, ocr_text,
@@ -328,9 +374,11 @@ final class FileIndexer: ObservableObject {
         saveConfig()
         BookmarkStore.remove(path: path)
         reachability[path] = nil
+        lastIndexed[path] = nil
 
         dbQueue.async {
             self.query("DELETE FROM files WHERE folder_root = ?", [.text(path)])
+            self.query("DELETE FROM folder_state WHERE root = ?", [.text(path)])
             self.refreshStatsOnQueue()
         }
     }
@@ -405,6 +453,21 @@ final class FileIndexer: ObservableObject {
         let textVersion: Int
     }
 
+    /// Re-indexes folders that are online and haven't finished a scan within `maxAge`.
+    /// Cheap when little has changed, since only new and changed files are read.
+    func indexStaleFolders(olderThan maxAge: TimeInterval) {
+        guard autoReindexEnabled, !isIndexing else { return }
+        let stale = indexedFolders.filter { folder in
+            guard isReachable(folder) else { return false }
+            guard let last = lastIndexed[folder] else { return true }
+            return Date().timeIntervalSince(last) > maxAge
+        }
+        if !stale.isEmpty {
+            logger.info("Automatically re-indexing \(stale.count) folders")
+            indexFolders(stale)
+        }
+    }
+
     func cancelIndexing() {
         guard isIndexing else { return }
         queuedFolders.removeAll()
@@ -457,6 +520,7 @@ final class FileIndexer: ObservableObject {
                 self.isIndexing = false
                 self.isCancellingIndex = false
                 self.currentlyIndexing = nil
+                self.currentFileName = nil
                 self.indexProgress = total
                 self.lastSkippedFolders = skipped
                 self.refreshReachability()
@@ -497,7 +561,19 @@ final class FileIndexer: ObservableObject {
         var seen = Set<String>()
         var batch: [FileRecord] = []
         var scanned = 0
-        var lastReported = 0
+        var lastReport = Date.distantPast
+        var lastWrite = Date()
+
+        // Throttled by time rather than file count: reading PDFs over a VPN can take seconds each
+        func report(reading fileName: String? = nil) {
+            guard Date().timeIntervalSince(lastReport) >= 0.5 else { return }
+            lastReport = Date()
+            let progress = progressBase + scanned
+            DispatchQueue.main.async {
+                self.indexProgress = progress
+                self.currentFileName = fileName
+            }
+        }
 
         for case let url as URL in enumerator {
             if isCancelled { break }
@@ -525,7 +601,11 @@ final class FileIndexer: ObservableObject {
                 }
 
                 // An empty string marks "extracted, no text found" so the file isn't retried every run
-                let text = wantsText ? (extractText(from: url, ext: ext, size: size) ?? "") : nil
+                var text: String?
+                if wantsText {
+                    report(reading: url.lastPathComponent)
+                    text = extractText(from: url, ext: ext, size: size) ?? ""
+                }
                 return FileRecord(path: path, name: url.lastPathComponent, ext: ext, size: size,
                                   modified: modified, text: text,
                                   textVersion: wantsText ? Self.textExtractionVersion : 0)
@@ -533,16 +613,14 @@ final class FileIndexer: ObservableObject {
 
             if let record {
                 batch.append(record)
-                if batch.count >= Self.batchSize {
+                // Also flush every few seconds so slow runs become searchable as they go
+                if batch.count >= Self.batchSize || Date().timeIntervalSince(lastWrite) > 5 {
                     write(batch, root: root)
                     batch.removeAll(keepingCapacity: true)
+                    lastWrite = Date()
                 }
             }
-            if scanned - lastReported >= 250 {
-                lastReported = scanned
-                let progress = progressBase + scanned
-                DispatchQueue.main.async { self.indexProgress = progress }
-            }
+            report()
         }
         if !batch.isEmpty { write(batch, root: root) }
 
@@ -553,8 +631,18 @@ final class FileIndexer: ObservableObject {
                 !seen.contains(path) && !unreadable.contains { path.hasPrefix($0 + "/") }
             }
             deleteRows(stale)
+            recordCompletedScan(of: root)
         }
         return scanned
+    }
+
+    private func recordCompletedScan(of root: String) {
+        let now = Date()
+        dbQueue.sync {
+            _ = query("INSERT OR REPLACE INTO folder_state (root, last_indexed) VALUES (?, ?)",
+                      [.text(root), .text(Self.isoFormatter.string(from: now))])
+        }
+        DispatchQueue.main.async { self.lastIndexed[root] = now }
     }
 
     private func isExcluded(_ name: String, _ options: IndexOptions) -> Bool {
@@ -634,15 +722,52 @@ final class FileIndexer: ObservableObject {
 
     // MARK: - Text extraction
 
+    private static let documentTypes: [String: NSAttributedString.DocumentType] = [
+        "doc": .docFormat, "docx": .officeOpenXML, "rtf": .rtf
+    ]
+    private static let plainTextExtensions: Set<String> = ["txt", "csv", "md", "eml", "htm", "html"]
+
     private static func supportsTextExtraction(_ ext: String) -> Bool {
-        ext == "pdf" || imageExtensions.contains(ext)
+        ext == "pdf" || ext == "msg" || documentTypes[ext] != nil
+            || plainTextExtensions.contains(ext) || imageExtensions.contains(ext)
     }
 
     private func extractText(from url: URL, ext: String, size: Int64) -> String? {
-        if ext == "pdf" {
+        switch ext {
+        case "pdf":
             return size < 200_000_000 ? extractPDFText(url) : nil
+        case "msg":
+            guard size < 200_000_000, let message = try? OutlookMessage(contentsOf: url) else { return nil }
+            return String(message.searchableText.prefix(Self.maxTextLength))
+        case _ where Self.documentTypes[ext] != nil:
+            // The Word/RTF importers are safe off the main thread (unlike the HTML one)
+            guard size < 100_000_000,
+                  let document = try? NSAttributedString(url: url,
+                                                         options: [.documentType: Self.documentTypes[ext]!],
+                                                         documentAttributes: nil) else { return nil }
+            return String(document.string.prefix(Self.maxTextLength))
+        case _ where Self.plainTextExtensions.contains(ext):
+            return size < 20_000_000 ? readPlainText(url, ext: ext) : nil
+        default:
+            return size < 20_000_000 ? recognizeImage(at: url) : nil
         }
-        return size < 20_000_000 ? recognizeImage(at: url) : nil
+    }
+
+    private func readPlainText(_ url: URL, ext: String) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        var text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? ""
+        switch ext {
+        case "htm", "html":
+            text = OutlookMessage.plainText(fromHTML: Data(text.utf8))
+        case "eml":
+            // Drop base64-encoded parts (attachments, images), which would only add noise
+            text = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { $0.count < 60 || $0.contains(" ") }
+                .joined(separator: "\n")
+        default:
+            break
+        }
+        return String(text.prefix(Self.maxTextLength))
     }
 
     /// Reads every page's text layer, and OCRs pages that have none (scans), up to a limit.
@@ -703,85 +828,139 @@ final class FileIndexer: ObservableObject {
     // MARK: - Search
 
     /// Searches names, folder paths, and extracted text. `text` accepts the syntax in
-    /// SearchQueryParser. Results are best match first when there are words to rank by,
-    /// otherwise newest first. Safe to call from any thread except `dbQueue`.
+    /// SearchQueryParser. Files whose name contains everything typed come first, then other
+    /// matches by relevance; with only filters, newest first. Safe to call from any thread except `dbQueue`.
     func search(_ text: String, fileType: String? = nil, folders: [String] = [], limit: Int = 1000) -> [FileItem] {
         let parsed = SearchQueryParser.parse(text)
-        var clauses: [String] = []
-        var params: [SQLValue] = []
-
-        if let match = SearchQueryParser.ftsMatchExpression(for: parsed) {
-            clauses.append("files_fts MATCH ?")
-            params.append(.text(match))
-        } else if parsed.hasText {
-            // Only punctuation was typed; fall back to a plain name match
-            clauses.append("f.name LIKE ? ESCAPE '\\'")
-            params.append(.text("%\(Self.likeEscaped((parsed.textTokens + parsed.exactPhrases).joined(separator: " ")))%"))
-        }
+        var filters: [String] = []
+        var filterParams: [SQLValue] = []
 
         if !parsed.fileTypes.isEmpty {
-            clauses.append("f.extension IN (\(parsed.fileTypes.map { _ in "?" }.joined(separator: ", ")))")
-            params += parsed.fileTypes.map { .text($0) }
+            filters.append("f.extension IN (\(parsed.fileTypes.map { _ in "?" }.joined(separator: ", ")))")
+            filterParams += parsed.fileTypes.map { .text($0) }
         }
         if let fileType {
-            clauses.append("f.extension = ?")
-            params.append(.text(fileType.lowercased().replacingOccurrences(of: ".", with: "")))
+            filters.append("f.extension = ?")
+            filterParams.append(.text(fileType.lowercased().replacingOccurrences(of: ".", with: "")))
         }
         if !folders.isEmpty {
-            clauses.append("(" + folders.map { _ in "f.path LIKE ? ESCAPE '\\'" }.joined(separator: " OR ") + ")")
-            params += folders.map { .text(Self.likeEscaped($0) + "/%") }
+            filters.append("(" + folders.map { _ in "f.path LIKE ? ESCAPE '\\'" }.joined(separator: " OR ") + ")")
+            filterParams += folders.map { .text(Self.likeEscaped($0) + "/%") }
         }
         for fragment in parsed.pathContains {
-            clauses.append("f.path LIKE ? ESCAPE '\\'")
-            params.append(.text("%\(Self.likeEscaped(fragment))%"))
+            filters.append("f.path LIKE ? ESCAPE '\\'")
+            filterParams.append(.text("%\(Self.likeEscaped(fragment))%"))
         }
         if let after = parsed.modifiedAfter {
-            clauses.append("f.modified_time >= ?")
-            params.append(.text(Self.isoFormatter.string(from: after)))
+            filters.append("f.modified_time >= ?")
+            filterParams.append(.text(Self.isoFormatter.string(from: after)))
         }
         if let before = parsed.modifiedBefore {
-            clauses.append("f.modified_time < ?")
-            params.append(.text(Self.isoFormatter.string(from: before)))
+            filters.append("f.modified_time < ?")
+            filterParams.append(.text(Self.isoFormatter.string(from: before)))
         }
         if let minSize = parsed.minSize {
-            clauses.append("f.size >= ?")
-            params.append(.int(minSize))
+            filters.append("f.size >= ?")
+            filterParams.append(.int(minSize))
         }
         if let maxSize = parsed.maxSize {
-            clauses.append("f.size <= ?")
-            params.append(.int(maxSize))
+            filters.append("f.size <= ?")
+            filterParams.append(.int(maxSize))
         }
 
-        guard !clauses.isEmpty else { return [] }
-
-        let usesFTS = clauses.first == "files_fts MATCH ?"
-        let sql = """
-        SELECT f.path, f.name, f.extension, f.size, f.modified_time, f.folder_root
-        FROM \(usesFTS ? "files_fts JOIN files f ON f.id = files_fts.rowid" : "files f")
-        WHERE \(clauses.joined(separator: " AND "))
-        ORDER BY \(usesFTS ? "bm25(files_fts, 10.0, 2.0, 1.0)" : "f.modified_time DESC")
-        LIMIT \(limit)
-        """
+        let match = SearchQueryParser.ftsMatchExpression(for: parsed)
+        let nameTerms = parsed.textTokens + parsed.exactPhrases
+        guard !nameTerms.isEmpty || !filters.isEmpty else { return [] }
 
         var results: [FileItem] = []
         dbQueue.sync {
-            _ = query(sql, params) {
-                results.append(FileItem(
-                    path: Self.columnText($0, 0),
-                    name: Self.columnText($0, 1),
-                    fileExtension: Self.columnText($0, 2),
-                    size: sqlite3_column_int64($0, 3),
-                    modifiedTime: Self.isoFormatter.date(from: Self.columnText($0, 4)) ?? .distantPast,
-                    folderRoot: Self.columnText($0, 5)
-                ))
+            guard !nameTerms.isEmpty else {
+                results = fetchFiles(from: "files f", where: filters, filterParams, orderBy: "f.modified_time DESC", limit: limit).map(\.item)
+                return
+            }
+
+            // Word matches across names, paths, and text, ranked (fast via the full-text index)
+            var ranked: [(id: Int64, item: FileItem)] = []
+            if let match {
+                ranked = fetchFiles(from: "files_fts JOIN files f ON f.id = files_fts.rowid",
+                                    where: ["files_fts MATCH ?"] + filters, [.text(match)] + filterParams,
+                                    orderBy: "bm25(files_fts, 10.0, 2.0, 1.0)", limit: limit)
+            }
+            // Names containing what was typed anywhere, e.g. "2023" in "Budget2023.pdf",
+            // which word matching can't find. A plain scan of names is fast enough.
+            let named = fetchFiles(from: "files f",
+                                   where: nameTerms.map { _ in "f.name LIKE ? ESCAPE '\\'" } + filters,
+                                   nameTerms.map { .text("%\(Self.likeEscaped($0))%") } + filterParams,
+                                   orderBy: "f.modified_time DESC", limit: limit)
+
+            let namedPaths = Set(named.map(\.item.path))
+            let rankedPaths = Set(ranked.map(\.item.path))
+            let merged = ranked.filter { namedPaths.contains($0.item.path) }
+                + named.filter { !rankedPaths.contains($0.item.path) }
+                + ranked.filter { !namedPaths.contains($0.item.path) }
+            results = Array(merged.prefix(limit)).map(\.item)
+
+            if let match {
+                addSnippets(to: &results, ids: Dictionary(merged.map { ($0.item.path, $0.id) }, uniquingKeysWith: { a, _ in a }), match: match)
             }
         }
         return results
     }
 
+    private func fetchFiles(from source: String, where clauses: [String], _ params: [SQLValue],
+                            orderBy: String, limit: Int) -> [(id: Int64, item: FileItem)] {
+        var rows: [(id: Int64, item: FileItem)] = []
+        let sql = """
+        SELECT f.id, f.path, f.name, f.extension, f.size, f.modified_time, f.folder_root
+        FROM \(source)
+        \(clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "))
+        ORDER BY \(orderBy)
+        LIMIT \(limit)
+        """
+        _ = query(sql, params) {
+            rows.append((sqlite3_column_int64($0, 0), FileItem(
+                path: Self.columnText($0, 1),
+                name: Self.columnText($0, 2),
+                fileExtension: Self.columnText($0, 3),
+                size: sqlite3_column_int64($0, 4),
+                modifiedTime: Self.isoFormatter.date(from: Self.columnText($0, 5)) ?? .distantPast,
+                folderRoot: Self.columnText($0, 6)
+            )))
+        }
+        return rows
+    }
+
+    /// Marks highlighted words in snippets; the UI turns these into bold text
+    static let highlightStart = "\u{2}"
+    static let highlightEnd = "\u{3}"
+
+    /// Adds a short excerpt around the match for results that matched inside the file's text.
+    /// Only the top results get one, since building excerpts means reading each file's text.
+    private func addSnippets(to results: inout [FileItem], ids: [String: Int64], match: String) {
+        let top = results.prefix(100).compactMap { ids[$0.path] }
+        guard !top.isEmpty else { return }
+
+        var snippets: [Int64: String] = [:]
+        _ = query("""
+        SELECT rowid, snippet(files_fts, 2, char(2), char(3), '…', 14)
+        FROM files_fts
+        WHERE files_fts MATCH ? AND rowid IN (\(top.map(String.init).joined(separator: ",")))
+        """, [.text("ocr_text : (\(match))")]) {
+            snippets[sqlite3_column_int64($0, 0)] = Self.columnText($0, 1)
+        }
+
+        for index in results.indices.prefix(100) {
+            guard let id = ids[results[index].path], let snippet = snippets[id], snippet.contains(Self.highlightStart) else { continue }
+            results[index].snippet = snippet
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        }
+    }
+
     func clearDatabase() {
         dbQueue.async {
             self.query("DELETE FROM files")
+            self.query("DELETE FROM folder_state")
+            DispatchQueue.main.async { self.lastIndexed = [:] }
             self.refreshStatsOnQueue()
         }
     }

@@ -23,8 +23,10 @@ enum BookmarkStore {
     static func resolve(path: String) -> URL? {
         guard let data = loadAll()[path] else { return nil }
         var stale = false
+        // Never mount or show UI: resolving a bookmark to an unmounted share would otherwise
+        // try to connect to the server (and pop an error when it isn't reachable)
         guard let url = try? URL(resolvingBookmarkData: data,
-                                 options: [.withSecurityScope],
+                                 options: [.withSecurityScope, .withoutMounting, .withoutUI],
                                  relativeTo: nil,
                                  bookmarkDataIsStale: &stale) else { return nil }
 

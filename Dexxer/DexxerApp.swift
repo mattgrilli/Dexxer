@@ -23,7 +23,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem?
     let indexer = FileIndexer()
     lazy var searchModel = SearchModel(indexer: indexer)
+    lazy var quickSearch = QuickSearchController(indexer: indexer) { [weak self] query in
+        self?.openMainWindow()
+        self?.searchModel.search(for: query)
+    }
     private var mainWindow: NSWindow?
+    private var autoIndexTimer: Timer?
+
+    /// Folders not fully indexed within this long get re-indexed automatically
+    private static let staleAge: TimeInterval = 12 * 60 * 60
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
@@ -53,6 +61,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didMountNotification, object: nil)
         nc.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didUnmountNotification, object: nil)
+
+        // Registers the global shortcut
+        _ = quickSearch
+
+        // Keep the index current: shortly after launch, then hourly
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+        }
+        autoIndexTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { [weak self] _ in
+            self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+        }
     }
 
     // MARK: - URL Scheme Handling
@@ -81,6 +100,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func volumesChanged(_ note: Notification) {
         indexer.refreshReachability()
+        // A share just came back: catch up on anything that changed while it was away
+        if note.name == NSWorkspace.didMountNotification {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                self?.indexer.indexStaleFolders(olderThan: Self.staleAge)
+            }
+        }
     }
 
     // MARK: - Menu
@@ -91,7 +116,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open Dexxer", action: #selector(openMainWindow), keyEquivalent: "o"))
-        menu.addItem(NSMenuItem(title: "Search…", action: #selector(openMainWindowAndFocusSearch), keyEquivalent: "f"))
+        let quickItem = NSMenuItem(title: "Quick Search…", action: #selector(showQuickSearch), keyEquivalent: "")
+        if quickSearch.shortcut != .off {
+            quickItem.title += "  (\(quickSearch.shortcut.label))"
+        }
+        menu.addItem(quickItem)
         menu.addItem(.separator())
 
         let stats = indexer.stats
@@ -168,9 +197,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc func openMainWindowAndFocusSearch() {
-        openMainWindow()
-        searchModel.requestFocus()
+    @objc func showQuickSearch() {
+        quickSearch.show()
     }
 
     // MARK: - Window
@@ -186,7 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.title = "Dexxer"
             window.isReleasedWhenClosed = false
             window.delegate = self
-            window.contentView = NSHostingView(rootView: MainView(indexer: indexer, search: searchModel))
+            window.contentView = NSHostingView(rootView: MainView(indexer: indexer, search: searchModel, quickSearch: quickSearch))
             window.center()
             window.setFrameAutosaveName("DexxerMainWindow")
             mainWindow = window

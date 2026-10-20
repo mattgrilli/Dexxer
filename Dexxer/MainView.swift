@@ -10,6 +10,7 @@ import SwiftUI
 struct MainView: View {
     @ObservedObject var indexer: FileIndexer
     @ObservedObject var search: SearchModel
+    @ObservedObject var quickSearch: QuickSearchController
     @StateObject private var scopesStore = ScopesStore()
     @State private var selectedView: NavigationItem = .search
     @State private var isDropTargeted = false
@@ -71,7 +72,7 @@ struct MainView: View {
             case .search:
                 SearchContentView(indexer: indexer, model: search, scopesStore: scopesStore)
             case .settings:
-                SettingsContentView(indexer: indexer)
+                SettingsContentView(indexer: indexer, quickSearch: quickSearch)
             }
         }
         .frame(minWidth: 900, minHeight: 560)
@@ -89,6 +90,17 @@ struct SidebarFolderRow: View {
 
     private var name: String { FolderActions.displayName(folder) }
 
+    private func lastIndexedSummary(count: Int) -> String {
+        let files = "\(count.formatted()) files"
+        guard let date = indexer.lastIndexed[folder] else { return "\(files) · not fully indexed" }
+        return "\(files) · \(date.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated)))"
+    }
+
+    private var tooltip: String {
+        guard let date = indexer.lastIndexed[folder] else { return folder }
+        return "\(folder)\nLast fully indexed \(date.formatted(date: .abbreviated, time: .shortened))"
+    }
+
     var body: some View {
         let reachable = indexer.isReachable(folder)
         let isNetwork = indexer.isNetworkFolder(folder)
@@ -105,7 +117,7 @@ struct SidebarFolderRow: View {
                     .truncationMode(.middle)
                     .foregroundStyle(reachable ? .primary : .secondary)
                 if reachable {
-                    Text("\(count.formatted()) files")
+                    Text(lastIndexedSummary(count: count))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
@@ -122,7 +134,7 @@ struct SidebarFolderRow: View {
                     .controlSize(.small)
             }
         }
-        .help(folder)
+        .help(tooltip)
         .contextMenu {
             Button("Re-Index") { FolderActions.reindex(folder, indexer: indexer) }
                 .disabled(indexer.currentlyIndexing == folder)
@@ -170,6 +182,13 @@ struct SidebarStatusView: View {
                 Text("\(indexer.indexProgress.formatted()) files checked")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                if let fileName = indexer.currentFileName {
+                    Text("Reading \(fileName)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             } else {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 2) {
