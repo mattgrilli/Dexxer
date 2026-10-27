@@ -52,6 +52,8 @@ final class FileIndexer: ObservableObject {
     @Published private(set) var reachability: [String: Bool] = [:]
     /// Folders the last run skipped because they were offline
     @Published private(set) var lastSkippedFolders: [String] = []
+    /// Set when text recognition stopped responding during the last run, so scans were skipped
+    @Published private(set) var textRecognitionStalled = false
     /// When each folder last finished a complete scan (stopped or interrupted runs don't count)
     @Published private(set) var lastIndexed: [String: Date] = [:]
 
@@ -70,6 +72,16 @@ final class FileIndexer: ObservableObject {
 
     private let cancelRequested = OSAllocatedUnfairLock(initialState: false)
     private var isCancelled: Bool { cancelRequested.withLock { $0 } }
+
+    // Text recognition safeguards. Only touched from the indexing thread during a run.
+    /// Longest a single OCR call may take. Vision can stop responding entirely (seen on macOS 27.0.1),
+    /// and without a limit that hangs indexing, and Stop, forever.
+    private static let ocrTimeout: TimeInterval = 60
+    /// After this many timeouts in one run, skip OCR for the rest of it
+    private static let maxOCRTimeouts = 2
+    private var ocrTimeouts = 0
+    /// Set when the current file's text couldn't be fully extracted, so it's retried next run
+    private var extractionIncomplete = false
     /// Folders requested while a run was in progress; indexed when it finishes
     private var queuedFolders: [String] = []
     private var reachabilityCheckInFlight = false
@@ -352,7 +364,13 @@ final class FileIndexer: ObservableObject {
 
     /// Adds a folder the user picked or dropped, remembering sandbox access to it.
     func addFolder(_ url: URL) -> AddFolderResult {
-        let path = url.standardizedFileURL.path
+        // Resolve symlinks (e.g. /var -> /private/var) so the root matches the paths the scan records.
+        // realpath, because URL.resolvingSymlinksInPath deliberately strips /private again.
+        let standardized = url.standardizedFileURL.path
+        let path = realpath(standardized, nil).map { resolved in
+            defer { free(resolved) }
+            return String(cString: resolved)
+        } ?? standardized
         if indexedFolders.contains(path) {
             BookmarkStore.save(path: path, url: url)  // refresh access anyway
             return .alreadyIndexed
@@ -491,6 +509,8 @@ final class FileIndexer: ObservableObject {
         isCancellingIndex = false
         indexProgress = 0
         cancelRequested.withLock { $0 = false }
+        textRecognitionStalled = false
+        ocrTimeouts = 0
 
         // Snapshot settings on the main thread so the background run never reads them mid-change
         let options = IndexOptions(
@@ -602,13 +622,19 @@ final class FileIndexer: ObservableObject {
 
                 // An empty string marks "extracted, no text found" so the file isn't retried every run
                 var text: String?
+                var textVersion = 0
                 if wantsText {
                     report(reading: url.lastPathComponent)
-                    text = extractText(from: url, ext: ext, size: size) ?? ""
+                    extractionIncomplete = false
+                    let extracted = extractText(from: url, ext: ext, size: size) ?? ""
+                    // Leave incomplete extractions (OCR stalled, or Stop pressed) unmarked so they're retried
+                    if !extractionIncomplete && !isCancelled {
+                        text = extracted
+                        textVersion = Self.textExtractionVersion
+                    }
                 }
                 return FileRecord(path: path, name: url.lastPathComponent, ext: ext, size: size,
-                                  modified: modified, text: text,
-                                  textVersion: wantsText ? Self.textExtractionVersion : 0)
+                                  modified: modified, text: text, textVersion: textVersion)
             }
 
             if let record {
@@ -812,17 +838,51 @@ final class FileIndexer: ObservableObject {
         return recognizeText(in: cgImage)
     }
 
+    private final class OCRResult: @unchecked Sendable {
+        var lines: [String]?
+    }
+
+    /// Runs Vision OCR with a time limit, checking for Stop while it works.
     private func recognizeText(in image: CGImage) -> String? {
+        guard ocrTimeouts < Self.maxOCRTimeouts else {
+            extractionIncomplete = true
+            return nil
+        }
+
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
-        do {
-            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-        } catch {
-            logger.error("OCR failed: \(error.localizedDescription, privacy: .public)")
-            return nil
+
+        let result = OCRResult()
+        let done = DispatchSemaphore(value: 0)
+        let logger = logger
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                result.lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            } catch {
+                logger.error("OCR failed: \(error.localizedDescription, privacy: .public)")
+            }
+            done.signal()
         }
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+
+        let deadline = Date().addingTimeInterval(Self.ocrTimeout)
+        while done.wait(timeout: .now() + 0.25) == .timedOut {
+            if isCancelled || Date() > deadline {
+                // A stalled call may never return; abandon it and move on
+                request.cancel()
+                extractionIncomplete = true
+                if !isCancelled {
+                    ocrTimeouts += 1
+                    logger.error("Text recognition stopped responding (\(self.ocrTimeouts) of \(Self.maxOCRTimeouts))")
+                    if ocrTimeouts >= Self.maxOCRTimeouts {
+                        DispatchQueue.main.async { self.textRecognitionStalled = true }
+                    }
+                }
+                return nil
+            }
+        }
+        return result.lines?.joined(separator: " ")
     }
 
     // MARK: - Search

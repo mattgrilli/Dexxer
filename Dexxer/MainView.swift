@@ -76,6 +76,9 @@ struct MainView: View {
                 SettingsContentView(indexer: indexer, quickSearch: quickSearch)
             }
         }
+        // The sidebar toggle is the only toolbar item. Removing it removes the toolbar, whose
+        // taller glass on macOS 27 otherwise covers the search bar. The sidebar still drags open and closed.
+        .toolbar(removing: .sidebarToggle)
         .frame(minWidth: 900, minHeight: 560)
         .onChange(of: search.focusRequest) { _, _ in
             selectedView = .search
@@ -218,6 +221,13 @@ struct SidebarStatusView: View {
                         .foregroundStyle(.orange)
                         .help(indexer.lastSkippedFolders.joined(separator: "\n"))
                 }
+            }
+
+            if indexer.textRecognitionStalled {
+                Label("Text recognition stopped responding, so scanned pages were skipped", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("macOS's text recognition didn't respond. Scanned files will be retried the next time folders are indexed; restarting the Mac usually clears this.")
             }
         }
         .padding(12)

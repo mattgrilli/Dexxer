@@ -230,6 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.center()
             window.setFrameAutosaveName("DexxerMainWindow")
             mainWindow = window
+            // SwiftUI's split view adds a toolbar even with no items; on macOS 27 it fades the
+            // top of the content, which hid the search bar. Dexxer doesn't use a toolbar.
+            DispatchQueue.main.async { window.toolbar = nil }
         }
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
