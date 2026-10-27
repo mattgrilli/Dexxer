@@ -184,16 +184,7 @@ struct SidebarStatusView: View {
                 }
                 ProgressView()
                     .progressViewStyle(.linear)
-                Text("\(indexer.indexProgress.formatted()) files checked")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if let fileName = indexer.currentFileName {
-                    Text("Reading \(fileName)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                IndexingProgressText(progress: indexer.progress)
             } else {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -238,6 +229,24 @@ struct SidebarStatusView: View {
         if indexer.isCancellingIndex { return "Stopping…" }
         guard let folder = indexer.currentlyIndexing else { return "Indexing…" }
         return "Indexing \(FolderActions.displayName(folder))…"
+    }
+}
+
+/// The live counters, in their own view so their updates don't redraw the rest of the window
+private struct IndexingProgressText: View {
+    @ObservedObject var progress: IndexingProgress
+
+    var body: some View {
+        Text("\(progress.filesChecked.formatted()) files checked")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        if let fileName = progress.currentFileName {
+            Text("Reading \(fileName)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
     }
 }
 

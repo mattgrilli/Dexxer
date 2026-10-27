@@ -212,6 +212,23 @@ final class FileIndexerTests: XCTestCase {
         XCTAssertEqual(upgraded.search("kangaroo").map(\.name), ["scan.jpg"])
     }
 
+    func testSearchDoesNotWaitForIndexingWrites() {
+        index()
+        let released = expectation(description: "write lock released")
+        let indexer = indexer!
+        DispatchQueue.global().async {
+            indexer.holdWriteTransactionForTesting(seconds: 2)
+            released.fulfill()
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let start = Date()
+        XCTAssertEqual(names("invoice"), ["invoice-2024.pdf"])
+        XCTAssertEqual(indexer.immediateSubfolders(of: rootPath).count, 3)  // a, ab, docs; node_modules is excluded
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1, "searches and the folder picker shouldn't wait for indexing writes")
+        wait(for: [released], timeout: 5)
+    }
+
     func testRemoveFolderDeletesItsRows() {
         index()
         indexer.removeFolder(rootPath)

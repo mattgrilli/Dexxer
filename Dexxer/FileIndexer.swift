@@ -16,6 +16,15 @@ import PDFKit
 /// Tells SQLite to copy bound strings, so Swift temporaries can't dangle.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// Indexing progress, published on its own so only the views that show it redraw as it ticks
+/// (twice a second during a run), not everything that observes the indexer.
+final class IndexingProgress: ObservableObject {
+    /// Files scanned so far in the current run
+    @Published fileprivate(set) var filesChecked = 0
+    /// File whose text is being extracted, when that is what the run is waiting on
+    @Published fileprivate(set) var currentFileName: String?
+}
+
 struct IndexStats: Equatable {
     var count = 0
     var totalSize: Int64 = 0
@@ -31,7 +40,11 @@ final class FileIndexer: ObservableObject {
     private var db: OpaquePointer?
     let dbPath: String
     private let configPath: String
-    /// All database access goes through this serial queue. Never call `dbQueue.sync` from code already on it.
+    /// Read-only connection for searches and the folder picker. The database is in WAL mode,
+    /// so these reads don't wait while indexing writes on `db`.
+    private var readDB: OpaquePointer?
+    private let readQueue = DispatchQueue(label: "com.mattgrilli.dexxer.read", qos: .userInitiated)
+    /// All writes (and indexing's own reads) go through this serial queue. Never call `dbQueue.sync` from code already on it.
     private let dbQueue = DispatchQueue(label: "com.mattgrilli.dexxer.db", qos: .userInitiated)
     private let logger = Logger(subsystem: "com.mattgrilli.dexxer", category: "indexing")
 
@@ -40,11 +53,8 @@ final class FileIndexer: ObservableObject {
     @Published private(set) var indexedFolders: [String] = []
     @Published private(set) var isIndexing = false
     @Published private(set) var isCancellingIndex = false
-    /// Files scanned so far in the current run
-    @Published private(set) var indexProgress = 0
     @Published private(set) var currentlyIndexing: String?
-    /// File whose text is being extracted, when that is what the run is waiting on
-    @Published private(set) var currentFileName: String?
+    let progress = IndexingProgress()
     @Published private(set) var stats = IndexStats()
     @Published private(set) var folderFileCounts: [String: Int] = [:]
     /// Last known reachability per indexed folder. Checked off the main thread because a hung
@@ -113,6 +123,11 @@ final class FileIndexer: ObservableObject {
         defaults.removeObject(forKey: "DexxerLastIndexedFolder")
 
         openDatabase()
+        if sqlite3_open_v2(dbPath, &readDB, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+            logger.error("Could not open read connection; searches will share the write connection")
+            sqlite3_close(readDB)
+            readDB = nil
+        }
         loadConfig()
 
         // The OCR setting used to reset on every launch. If the index already has
@@ -128,6 +143,7 @@ final class FileIndexer: ObservableObject {
     }
 
     deinit {
+        sqlite3_close(readDB)
         sqlite3_close(db)
     }
 
@@ -140,6 +156,10 @@ final class FileIndexer: ObservableObject {
     }
 
     private var lastError: String { String(cString: sqlite3_errmsg(db)) }
+
+    /// The connection for search reads, falling back to the main one if it couldn't open
+    private var searchDB: OpaquePointer? { readDB ?? db }
+    private var searchQueue: DispatchQueue { readDB == nil ? dbQueue : readQueue }
 
     @discardableResult
     private func exec(_ sql: String) -> Bool {
@@ -164,12 +184,15 @@ final class FileIndexer: ObservableObject {
         }
     }
 
-    /// Runs a statement and calls `row` for each result row. Call on `dbQueue` (or during init).
+    /// Runs a statement and calls `row` for each result row. Call on the queue that owns
+    /// `connection`: `dbQueue` for the main connection (the default), `searchQueue` for `searchDB`.
     @discardableResult
-    private func query(_ sql: String, _ params: [SQLValue] = [], row: (OpaquePointer) -> Void = { _ in }) -> Bool {
+    private func query(_ sql: String, _ params: [SQLValue] = [], on connection: OpaquePointer? = nil,
+                       row: (OpaquePointer) -> Void = { _ in }) -> Bool {
+        let connection = connection ?? db
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            logger.error("Prepare failed: \(self.lastError, privacy: .public)")
+        guard sqlite3_prepare_v2(connection, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            logger.error("Prepare failed: \(String(cString: sqlite3_errmsg(connection)), privacy: .public)")
             return false
         }
         defer { sqlite3_finalize(statement) }
@@ -180,7 +203,7 @@ final class FileIndexer: ObservableObject {
             case SQLITE_ROW: row(statement)
             case SQLITE_DONE: return true
             default:
-                logger.error("Step failed: \(self.lastError, privacy: .public)")
+                logger.error("Step failed: \(String(cString: sqlite3_errmsg(connection)), privacy: .public)")
                 return false
             }
         }
@@ -271,7 +294,8 @@ final class FileIndexer: ObservableObject {
         query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'files_fts')") {
             ftsExists = sqlite3_column_int($0, 0) == 1
         }
-        if ftsExists && !hasTextColumn {
+        let recreating = ftsExists && !hasTextColumn
+        if recreating {
             logger.warning("Search index is missing extracted text; recreating it")
             exec("DROP TRIGGER IF EXISTS files_fts_insert")
             exec("DROP TRIGGER IF EXISTS files_fts_delete")
@@ -307,6 +331,12 @@ final class FileIndexer: ObservableObject {
             VALUES (new.id, new.name, new.path, new.ocr_text);
         END
         """)
+
+        // Fill the recreated index now (about half a second for 50k files), so searches,
+        // which use a separate connection, never see it empty
+        if recreating {
+            exec("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        }
     }
 
     private func hasExtractedText() -> Bool {
@@ -507,7 +537,7 @@ final class FileIndexer: ObservableObject {
 
         isIndexing = true
         isCancellingIndex = false
-        indexProgress = 0
+        progress.filesChecked = 0
         cancelRequested.withLock { $0 = false }
         textRecognitionStalled = false
         ocrTimeouts = 0
@@ -540,8 +570,8 @@ final class FileIndexer: ObservableObject {
                 self.isIndexing = false
                 self.isCancellingIndex = false
                 self.currentlyIndexing = nil
-                self.currentFileName = nil
-                self.indexProgress = total
+                self.progress.currentFileName = nil
+                self.progress.filesChecked = total
                 self.lastSkippedFolders = skipped
                 self.refreshReachability()
                 completion?(total)
@@ -590,8 +620,8 @@ final class FileIndexer: ObservableObject {
             lastReport = Date()
             let progress = progressBase + scanned
             DispatchQueue.main.async {
-                self.indexProgress = progress
-                self.currentFileName = fileName
+                self.progress.filesChecked = progress
+                self.progress.currentFileName = fileName
             }
         }
 
@@ -933,7 +963,7 @@ final class FileIndexer: ObservableObject {
         guard !nameTerms.isEmpty || !filters.isEmpty else { return [] }
 
         var results: [FileItem] = []
-        dbQueue.sync {
+        searchQueue.sync {
             guard !nameTerms.isEmpty else {
                 results = fetchFiles(from: "files f", where: filters, filterParams, orderBy: "f.modified_time DESC", limit: limit).map(\.item)
                 return
@@ -977,7 +1007,7 @@ final class FileIndexer: ObservableObject {
         ORDER BY \(orderBy)
         LIMIT \(limit)
         """
-        _ = query(sql, params) {
+        _ = query(sql, params, on: searchDB) {
             rows.append((sqlite3_column_int64($0, 0), FileItem(
                 path: Self.columnText($0, 1),
                 name: Self.columnText($0, 2),
@@ -1005,7 +1035,7 @@ final class FileIndexer: ObservableObject {
         SELECT rowid, snippet(files_fts, 2, char(2), char(3), '…', 14)
         FROM files_fts
         WHERE files_fts MATCH ? AND rowid IN (\(top.map(String.init).joined(separator: ",")))
-        """, [.text("ocr_text : (\(match))")]) {
+        """, [.text("ocr_text : (\(match))")], on: searchDB) {
             snippets[sqlite3_column_int64($0, 0)] = Self.columnText($0, 1)
         }
 
@@ -1025,6 +1055,17 @@ final class FileIndexer: ObservableObject {
         }
     }
 
+    #if DEBUG
+    /// Holds the write connection in an open transaction, as a long indexing batch does (tests only)
+    func holdWriteTransactionForTesting(seconds: TimeInterval) {
+        dbQueue.sync {
+            exec("BEGIN IMMEDIATE")
+            Thread.sleep(forTimeInterval: seconds)
+            exec("COMMIT")
+        }
+    }
+    #endif
+
     // MARK: - Folder Discovery
 
     /// Immediate subfolders of `parentPath` that contain indexed files (for the folder picker tree)
@@ -1032,12 +1073,12 @@ final class FileIndexer: ObservableObject {
         // SQLite's substr/instr count Unicode code points, so measure the prefix the same way
         let start = Int64(parentPath.unicodeScalars.count + 2)
         var names: [String] = []
-        dbQueue.sync {
+        searchQueue.sync {
             _ = query("""
             SELECT DISTINCT substr(path, ?1, instr(substr(path, ?1), '/') - 1)
             FROM files
             WHERE path LIKE ?2 ESCAPE '\\' AND instr(substr(path, ?1), '/') > 0
-            """, [.int(start), .text(Self.likeEscaped(parentPath) + "/%")]) {
+            """, [.int(start), .text(Self.likeEscaped(parentPath) + "/%")], on: searchDB) {
                 names.append(Self.columnText($0, 0))
             }
         }
@@ -1048,8 +1089,8 @@ final class FileIndexer: ObservableObject {
     /// Every folder that contains an indexed file (for folder search in the picker)
     func allFolders() -> [String] {
         var folders: [String] = []
-        dbQueue.sync {
-            _ = query("SELECT DISTINCT substr(path, 1, length(path) - length(name) - 1) FROM files") {
+        searchQueue.sync {
+            _ = query("SELECT DISTINCT substr(path, 1, length(path) - length(name) - 1) FROM files", on: searchDB) {
                 folders.append(Self.columnText($0, 0))
             }
         }

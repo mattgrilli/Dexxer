@@ -159,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if indexer.isCancellingIndex {
                 addInfoItem("Stopping…", to: menu)
             } else {
-                addInfoItem("Indexing… \(indexer.indexProgress.formatted()) files checked", to: menu)
+                addInfoItem("Indexing… \(indexer.progress.filesChecked.formatted()) files checked", to: menu)
                 menu.addItem(NSMenuItem(title: "Stop Indexing", action: #selector(cancelIndexing), keyEquivalent: ""))
             }
         } else {
