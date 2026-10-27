@@ -16,6 +16,15 @@ import PDFKit
 /// Tells SQLite to copy bound strings, so Swift temporaries can't dangle.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// Indexing progress, published on its own so only the views that show it redraw as it ticks
+/// (twice a second during a run), not everything that observes the indexer.
+final class IndexingProgress: ObservableObject {
+    /// Files scanned so far in the current run
+    @Published fileprivate(set) var filesChecked = 0
+    /// File whose text is being extracted, when that is what the run is waiting on
+    @Published fileprivate(set) var currentFileName: String?
+}
+
 struct IndexStats: Equatable {
     var count = 0
     var totalSize: Int64 = 0
@@ -31,7 +40,11 @@ final class FileIndexer: ObservableObject {
     private var db: OpaquePointer?
     let dbPath: String
     private let configPath: String
-    /// All database access goes through this serial queue. Never call `dbQueue.sync` from code already on it.
+    /// Read-only connection for searches and the folder picker. The database is in WAL mode,
+    /// so these reads don't wait while indexing writes on `db`.
+    private var readDB: OpaquePointer?
+    private let readQueue = DispatchQueue(label: "com.mattgrilli.dexxer.read", qos: .userInitiated)
+    /// All writes (and indexing's own reads) go through this serial queue. Never call `dbQueue.sync` from code already on it.
     private let dbQueue = DispatchQueue(label: "com.mattgrilli.dexxer.db", qos: .userInitiated)
     private let logger = Logger(subsystem: "com.mattgrilli.dexxer", category: "indexing")
 
@@ -40,11 +53,8 @@ final class FileIndexer: ObservableObject {
     @Published private(set) var indexedFolders: [String] = []
     @Published private(set) var isIndexing = false
     @Published private(set) var isCancellingIndex = false
-    /// Files scanned so far in the current run
-    @Published private(set) var indexProgress = 0
     @Published private(set) var currentlyIndexing: String?
-    /// File whose text is being extracted, when that is what the run is waiting on
-    @Published private(set) var currentFileName: String?
+    let progress = IndexingProgress()
     @Published private(set) var stats = IndexStats()
     @Published private(set) var folderFileCounts: [String: Int] = [:]
     /// Last known reachability per indexed folder. Checked off the main thread because a hung
@@ -52,6 +62,8 @@ final class FileIndexer: ObservableObject {
     @Published private(set) var reachability: [String: Bool] = [:]
     /// Folders the last run skipped because they were offline
     @Published private(set) var lastSkippedFolders: [String] = []
+    /// Set when text recognition stopped responding during the last run, so scans were skipped
+    @Published private(set) var textRecognitionStalled = false
     /// When each folder last finished a complete scan (stopped or interrupted runs don't count)
     @Published private(set) var lastIndexed: [String: Date] = [:]
 
@@ -70,6 +82,16 @@ final class FileIndexer: ObservableObject {
 
     private let cancelRequested = OSAllocatedUnfairLock(initialState: false)
     private var isCancelled: Bool { cancelRequested.withLock { $0 } }
+
+    // Text recognition safeguards. Only touched from the indexing thread during a run.
+    /// Longest a single OCR call may take. Vision can stop responding entirely (seen on macOS 27.0.1),
+    /// and without a limit that hangs indexing, and Stop, forever.
+    private static let ocrTimeout: TimeInterval = 60
+    /// After this many timeouts in one run, skip OCR for the rest of it
+    private static let maxOCRTimeouts = 2
+    private var ocrTimeouts = 0
+    /// Set when the current file's text couldn't be fully extracted, so it's retried next run
+    private var extractionIncomplete = false
     /// Folders requested while a run was in progress; indexed when it finishes
     private var queuedFolders: [String] = []
     private var reachabilityCheckInFlight = false
@@ -101,6 +123,11 @@ final class FileIndexer: ObservableObject {
         defaults.removeObject(forKey: "DexxerLastIndexedFolder")
 
         openDatabase()
+        if sqlite3_open_v2(dbPath, &readDB, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+            logger.error("Could not open read connection; searches will share the write connection")
+            sqlite3_close(readDB)
+            readDB = nil
+        }
         loadConfig()
 
         // The OCR setting used to reset on every launch. If the index already has
@@ -116,6 +143,7 @@ final class FileIndexer: ObservableObject {
     }
 
     deinit {
+        sqlite3_close(readDB)
         sqlite3_close(db)
     }
 
@@ -128,6 +156,10 @@ final class FileIndexer: ObservableObject {
     }
 
     private var lastError: String { String(cString: sqlite3_errmsg(db)) }
+
+    /// The connection for search reads, falling back to the main one if it couldn't open
+    private var searchDB: OpaquePointer? { readDB ?? db }
+    private var searchQueue: DispatchQueue { readDB == nil ? dbQueue : readQueue }
 
     @discardableResult
     private func exec(_ sql: String) -> Bool {
@@ -152,12 +184,15 @@ final class FileIndexer: ObservableObject {
         }
     }
 
-    /// Runs a statement and calls `row` for each result row. Call on `dbQueue` (or during init).
+    /// Runs a statement and calls `row` for each result row. Call on the queue that owns
+    /// `connection`: `dbQueue` for the main connection (the default), `searchQueue` for `searchDB`.
     @discardableResult
-    private func query(_ sql: String, _ params: [SQLValue] = [], row: (OpaquePointer) -> Void = { _ in }) -> Bool {
+    private func query(_ sql: String, _ params: [SQLValue] = [], on connection: OpaquePointer? = nil,
+                       row: (OpaquePointer) -> Void = { _ in }) -> Bool {
+        let connection = connection ?? db
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            logger.error("Prepare failed: \(self.lastError, privacy: .public)")
+        guard sqlite3_prepare_v2(connection, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            logger.error("Prepare failed: \(String(cString: sqlite3_errmsg(connection)), privacy: .public)")
             return false
         }
         defer { sqlite3_finalize(statement) }
@@ -168,7 +203,7 @@ final class FileIndexer: ObservableObject {
             case SQLITE_ROW: row(statement)
             case SQLITE_DONE: return true
             default:
-                logger.error("Step failed: \(self.lastError, privacy: .public)")
+                logger.error("Step failed: \(String(cString: sqlite3_errmsg(connection)), privacy: .public)")
                 return false
             }
         }
@@ -259,7 +294,8 @@ final class FileIndexer: ObservableObject {
         query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'files_fts')") {
             ftsExists = sqlite3_column_int($0, 0) == 1
         }
-        if ftsExists && !hasTextColumn {
+        let recreating = ftsExists && !hasTextColumn
+        if recreating {
             logger.warning("Search index is missing extracted text; recreating it")
             exec("DROP TRIGGER IF EXISTS files_fts_insert")
             exec("DROP TRIGGER IF EXISTS files_fts_delete")
@@ -295,6 +331,12 @@ final class FileIndexer: ObservableObject {
             VALUES (new.id, new.name, new.path, new.ocr_text);
         END
         """)
+
+        // Fill the recreated index now (about half a second for 50k files), so searches,
+        // which use a separate connection, never see it empty
+        if recreating {
+            exec("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        }
     }
 
     private func hasExtractedText() -> Bool {
@@ -352,7 +394,13 @@ final class FileIndexer: ObservableObject {
 
     /// Adds a folder the user picked or dropped, remembering sandbox access to it.
     func addFolder(_ url: URL) -> AddFolderResult {
-        let path = url.standardizedFileURL.path
+        // Resolve symlinks (e.g. /var -> /private/var) so the root matches the paths the scan records.
+        // realpath, because URL.resolvingSymlinksInPath deliberately strips /private again.
+        let standardized = url.standardizedFileURL.path
+        let path = realpath(standardized, nil).map { resolved in
+            defer { free(resolved) }
+            return String(cString: resolved)
+        } ?? standardized
         if indexedFolders.contains(path) {
             BookmarkStore.save(path: path, url: url)  // refresh access anyway
             return .alreadyIndexed
@@ -489,8 +537,10 @@ final class FileIndexer: ObservableObject {
 
         isIndexing = true
         isCancellingIndex = false
-        indexProgress = 0
+        progress.filesChecked = 0
         cancelRequested.withLock { $0 = false }
+        textRecognitionStalled = false
+        ocrTimeouts = 0
 
         // Snapshot settings on the main thread so the background run never reads them mid-change
         let options = IndexOptions(
@@ -520,8 +570,8 @@ final class FileIndexer: ObservableObject {
                 self.isIndexing = false
                 self.isCancellingIndex = false
                 self.currentlyIndexing = nil
-                self.currentFileName = nil
-                self.indexProgress = total
+                self.progress.currentFileName = nil
+                self.progress.filesChecked = total
                 self.lastSkippedFolders = skipped
                 self.refreshReachability()
                 completion?(total)
@@ -570,8 +620,8 @@ final class FileIndexer: ObservableObject {
             lastReport = Date()
             let progress = progressBase + scanned
             DispatchQueue.main.async {
-                self.indexProgress = progress
-                self.currentFileName = fileName
+                self.progress.filesChecked = progress
+                self.progress.currentFileName = fileName
             }
         }
 
@@ -602,13 +652,19 @@ final class FileIndexer: ObservableObject {
 
                 // An empty string marks "extracted, no text found" so the file isn't retried every run
                 var text: String?
+                var textVersion = 0
                 if wantsText {
                     report(reading: url.lastPathComponent)
-                    text = extractText(from: url, ext: ext, size: size) ?? ""
+                    extractionIncomplete = false
+                    let extracted = extractText(from: url, ext: ext, size: size) ?? ""
+                    // Leave incomplete extractions (OCR stalled, or Stop pressed) unmarked so they're retried
+                    if !extractionIncomplete && !isCancelled {
+                        text = extracted
+                        textVersion = Self.textExtractionVersion
+                    }
                 }
                 return FileRecord(path: path, name: url.lastPathComponent, ext: ext, size: size,
-                                  modified: modified, text: text,
-                                  textVersion: wantsText ? Self.textExtractionVersion : 0)
+                                  modified: modified, text: text, textVersion: textVersion)
             }
 
             if let record {
@@ -812,17 +868,51 @@ final class FileIndexer: ObservableObject {
         return recognizeText(in: cgImage)
     }
 
+    private final class OCRResult: @unchecked Sendable {
+        var lines: [String]?
+    }
+
+    /// Runs Vision OCR with a time limit, checking for Stop while it works.
     private func recognizeText(in image: CGImage) -> String? {
+        guard ocrTimeouts < Self.maxOCRTimeouts else {
+            extractionIncomplete = true
+            return nil
+        }
+
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
-        do {
-            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-        } catch {
-            logger.error("OCR failed: \(error.localizedDescription, privacy: .public)")
-            return nil
+
+        let result = OCRResult()
+        let done = DispatchSemaphore(value: 0)
+        let logger = logger
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                result.lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            } catch {
+                logger.error("OCR failed: \(error.localizedDescription, privacy: .public)")
+            }
+            done.signal()
         }
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+
+        let deadline = Date().addingTimeInterval(Self.ocrTimeout)
+        while done.wait(timeout: .now() + 0.25) == .timedOut {
+            if isCancelled || Date() > deadline {
+                // A stalled call may never return; abandon it and move on
+                request.cancel()
+                extractionIncomplete = true
+                if !isCancelled {
+                    ocrTimeouts += 1
+                    logger.error("Text recognition stopped responding (\(self.ocrTimeouts) of \(Self.maxOCRTimeouts))")
+                    if ocrTimeouts >= Self.maxOCRTimeouts {
+                        DispatchQueue.main.async { self.textRecognitionStalled = true }
+                    }
+                }
+                return nil
+            }
+        }
+        return result.lines?.joined(separator: " ")
     }
 
     // MARK: - Search
@@ -873,7 +963,7 @@ final class FileIndexer: ObservableObject {
         guard !nameTerms.isEmpty || !filters.isEmpty else { return [] }
 
         var results: [FileItem] = []
-        dbQueue.sync {
+        searchQueue.sync {
             guard !nameTerms.isEmpty else {
                 results = fetchFiles(from: "files f", where: filters, filterParams, orderBy: "f.modified_time DESC", limit: limit).map(\.item)
                 return
@@ -917,7 +1007,7 @@ final class FileIndexer: ObservableObject {
         ORDER BY \(orderBy)
         LIMIT \(limit)
         """
-        _ = query(sql, params) {
+        _ = query(sql, params, on: searchDB) {
             rows.append((sqlite3_column_int64($0, 0), FileItem(
                 path: Self.columnText($0, 1),
                 name: Self.columnText($0, 2),
@@ -945,7 +1035,7 @@ final class FileIndexer: ObservableObject {
         SELECT rowid, snippet(files_fts, 2, char(2), char(3), '…', 14)
         FROM files_fts
         WHERE files_fts MATCH ? AND rowid IN (\(top.map(String.init).joined(separator: ",")))
-        """, [.text("ocr_text : (\(match))")]) {
+        """, [.text("ocr_text : (\(match))")], on: searchDB) {
             snippets[sqlite3_column_int64($0, 0)] = Self.columnText($0, 1)
         }
 
@@ -965,6 +1055,17 @@ final class FileIndexer: ObservableObject {
         }
     }
 
+    #if DEBUG
+    /// Holds the write connection in an open transaction, as a long indexing batch does (tests only)
+    func holdWriteTransactionForTesting(seconds: TimeInterval) {
+        dbQueue.sync {
+            exec("BEGIN IMMEDIATE")
+            Thread.sleep(forTimeInterval: seconds)
+            exec("COMMIT")
+        }
+    }
+    #endif
+
     // MARK: - Folder Discovery
 
     /// Immediate subfolders of `parentPath` that contain indexed files (for the folder picker tree)
@@ -972,12 +1073,12 @@ final class FileIndexer: ObservableObject {
         // SQLite's substr/instr count Unicode code points, so measure the prefix the same way
         let start = Int64(parentPath.unicodeScalars.count + 2)
         var names: [String] = []
-        dbQueue.sync {
+        searchQueue.sync {
             _ = query("""
             SELECT DISTINCT substr(path, ?1, instr(substr(path, ?1), '/') - 1)
             FROM files
             WHERE path LIKE ?2 ESCAPE '\\' AND instr(substr(path, ?1), '/') > 0
-            """, [.int(start), .text(Self.likeEscaped(parentPath) + "/%")]) {
+            """, [.int(start), .text(Self.likeEscaped(parentPath) + "/%")], on: searchDB) {
                 names.append(Self.columnText($0, 0))
             }
         }
@@ -988,8 +1089,8 @@ final class FileIndexer: ObservableObject {
     /// Every folder that contains an indexed file (for folder search in the picker)
     func allFolders() -> [String] {
         var folders: [String] = []
-        dbQueue.sync {
-            _ = query("SELECT DISTINCT substr(path, 1, length(path) - length(name) - 1) FROM files") {
+        searchQueue.sync {
+            _ = query("SELECT DISTINCT substr(path, 1, length(path) - length(name) - 1) FROM files", on: searchDB) {
                 folders.append(Self.columnText($0, 0))
             }
         }

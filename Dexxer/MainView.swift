@@ -76,6 +76,9 @@ struct MainView: View {
                 SettingsContentView(indexer: indexer, quickSearch: quickSearch)
             }
         }
+        // The sidebar toggle is the only toolbar item. Removing it removes the toolbar, whose
+        // taller glass on macOS 27 otherwise covers the search bar. The sidebar still drags open and closed.
+        .toolbar(removing: .sidebarToggle)
         .frame(minWidth: 900, minHeight: 560)
         .onChange(of: search.focusRequest) { _, _ in
             selectedView = .search
@@ -181,16 +184,7 @@ struct SidebarStatusView: View {
                 }
                 ProgressView()
                     .progressViewStyle(.linear)
-                Text("\(indexer.indexProgress.formatted()) files checked")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if let fileName = indexer.currentFileName {
-                    Text("Reading \(fileName)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                IndexingProgressText(progress: indexer.progress)
             } else {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -219,6 +213,13 @@ struct SidebarStatusView: View {
                         .help(indexer.lastSkippedFolders.joined(separator: "\n"))
                 }
             }
+
+            if indexer.textRecognitionStalled {
+                Label("Text recognition stopped responding, so scanned pages were skipped", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("macOS's text recognition didn't respond. Scanned files will be retried the next time folders are indexed; restarting the Mac usually clears this.")
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -228,6 +229,24 @@ struct SidebarStatusView: View {
         if indexer.isCancellingIndex { return "Stopping…" }
         guard let folder = indexer.currentlyIndexing else { return "Indexing…" }
         return "Indexing \(FolderActions.displayName(folder))…"
+    }
+}
+
+/// The live counters, in their own view so their updates don't redraw the rest of the window
+private struct IndexingProgressText: View {
+    @ObservedObject var progress: IndexingProgress
+
+    var body: some View {
+        Text("\(progress.filesChecked.formatted()) files checked")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        if let fileName = progress.currentFileName {
+            Text("Reading \(fileName)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
     }
 }
 

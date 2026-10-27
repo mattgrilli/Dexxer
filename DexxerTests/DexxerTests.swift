@@ -115,6 +115,9 @@ final class FileIndexerTests: XCTestCase {
                           documentAttributes: [.documentType: type]).write(to: url)
     }
 
+    /// The root as Dexxer stored it, with symlinks resolved (temp folders live behind /var -> /private/var)
+    private var rootPath: String { indexer.indexedFolders[0] }
+
     private func index() {
         let done = expectation(description: "indexed")
         indexer.indexFolders { _ in done.fulfill() }
@@ -153,7 +156,7 @@ final class FileIndexerTests: XCTestCase {
 
     func testFolderFilterDoesNotMatchSiblingPrefix() {
         index()
-        let folderA = root.appendingPathComponent("a").path
+        let folderA = rootPath + "/a"
         XCTAssertEqual(names("type:txt", folders: [folderA]), ["notes.txt"])
     }
 
@@ -174,7 +177,7 @@ final class FileIndexerTests: XCTestCase {
     }
 
     func testRecordsLastCompletedScan() {
-        let path = root.standardizedFileURL.path
+        let path = rootPath
         XCTAssertNil(indexer.lastIndexed[path])
         index()
         let first = try? XCTUnwrap(indexer.lastIndexed[path])
@@ -209,9 +212,26 @@ final class FileIndexerTests: XCTestCase {
         XCTAssertEqual(upgraded.search("kangaroo").map(\.name), ["scan.jpg"])
     }
 
+    func testSearchDoesNotWaitForIndexingWrites() {
+        index()
+        let released = expectation(description: "write lock released")
+        let indexer = indexer!
+        DispatchQueue.global().async {
+            indexer.holdWriteTransactionForTesting(seconds: 2)
+            released.fulfill()
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let start = Date()
+        XCTAssertEqual(names("invoice"), ["invoice-2024.pdf"])
+        XCTAssertEqual(indexer.immediateSubfolders(of: rootPath).count, 3)  // a, ab, docs; node_modules is excluded
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1, "searches and the folder picker shouldn't wait for indexing writes")
+        wait(for: [released], timeout: 5)
+    }
+
     func testRemoveFolderDeletesItsRows() {
         index()
-        indexer.removeFolder(root.standardizedFileURL.path)
+        indexer.removeFolder(rootPath)
         XCTAssertTrue(names("invoice").isEmpty)
     }
 }

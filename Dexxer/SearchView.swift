@@ -808,20 +808,25 @@ private enum FolderSelectionState {
 }
 
 struct FolderSelectionView: View {
-    @ObservedObject var indexer: FileIndexer
+    /// Not observed: indexing updates would otherwise redraw this sheet constantly
+    let indexer: FileIndexer
     @ObservedObject var store: ScopesStore
     @Binding var selectedPaths: Set<String>
     var onClose: () -> Void
 
     @State private var rootFolders: [LazyFolderNode] = []
     @State private var filterText = ""
-    @State private var allFolders: [String] = []
+    @State private var allFolders: [String]?
+    @State private var filteredFolders: [String] = []
     @State private var saveScopeName = ""
     @State private var showSaveScope = false
 
-    private var filteredFolders: [String] {
-        let query = filterText.trimmingCharacters(in: .whitespaces)
-        return allFolders.filter { $0.localizedCaseInsensitiveContains(query) }
+    private var trimmedFilter: String { filterText.trimmingCharacters(in: .whitespaces) }
+
+    /// Filters once per change rather than on every redraw
+    private func applyFilter() {
+        let query = trimmedFilter
+        filteredFolders = query.isEmpty ? [] : (allFolders ?? []).filter { $0.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -869,6 +874,7 @@ struct FolderSelectionView: View {
                     .foregroundStyle(.secondary)
                 TextField("Filter folders", text: $filterText)
                     .textFieldStyle(.plain)
+                    .onChange(of: filterText) { _, _ in applyFilter() }
                 if !filterText.isEmpty {
                     Button { filterText = "" } label: {
                         Image(systemName: "xmark.circle.fill")
@@ -883,10 +889,20 @@ struct FolderSelectionView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if filterText.trimmingCharacters(in: .whitespaces).isEmpty {
+                    if trimmedFilter.isEmpty {
                         ForEach(rootFolders) { node in
                             LazyFolderTreeRow(node: node, indexer: indexer, selectedPaths: $selectedPaths, level: 0)
                         }
+                    } else if allFolders == nil {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading folders…").foregroundStyle(.secondary)
+                        }
+                        .padding(8)
+                    } else if filteredFolders.isEmpty {
+                        Text("No folders match “\(trimmedFilter)”")
+                            .foregroundStyle(.secondary)
+                            .padding(8)
                     } else {
                         ForEach(filteredFolders, id: \.self) { folder in
                             FolderListRow(folder: folder, state: FolderSelectionState(folder, in: selectedPaths)) {
@@ -921,7 +937,10 @@ struct FolderSelectionView: View {
             rootFolders = indexer.indexedFolders.map { LazyFolderNode(path: $0, indexer: indexer) }
             DispatchQueue.global(qos: .userInitiated).async {
                 let folders = indexer.allFolders()
-                DispatchQueue.main.async { allFolders = folders }
+                DispatchQueue.main.async {
+                    allFolders = folders
+                    applyFilter()
+                }
             }
         }
         .sheet(isPresented: $showSaveScope) {
